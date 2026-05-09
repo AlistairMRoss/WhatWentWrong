@@ -19,7 +19,8 @@
   ],
   "scripts": {
     "build": "tsc && mkdir -p dist/runtime && cp src/runtime/*.mjs dist/runtime/",
-    "prepublishOnly": "bun run build"
+    "prepublishOnly": "bun run build",
+    "release": "npm version patch && npm publish --access public"
   },
   "keywords": [
     "sst",

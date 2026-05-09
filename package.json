@@ -1,0 +1,48 @@
+{
+  "name": "whatwentwrong",
+  "version": "0.1.0",
+  "description": "Drop-in error alerting for SST v3 (ion) projects: SNS + CloudWatch alarms wired up with one .watch() call.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc && mkdir -p dist/runtime && cp src/runtime/*.mjs dist/runtime/",
+    "prepublishOnly": "bun run build"
+  },
+  "keywords": [
+    "sst",
+    "ion",
+    "pulumi",
+    "aws",
+    "cloudwatch",
+    "sns",
+    "alerting",
+    "monitoring",
+    "lambda"
+  ],
+  "license": "MIT",
+  "peerDependencies": {
+    "@pulumi/aws": "^6.0.0",
+    "@pulumi/pulumi": "^3.0.0",
+    "sst": "^3.0.0"
+  },
+  "devDependencies": {
+    "@pulumi/aws": "^6.0.0",
+    "@pulumi/pulumi": "^3.0.0",
+    "@types/bun": "latest",
+    "sst": "^3.0.0",
+    "typescript": "^5"
+  }
+}

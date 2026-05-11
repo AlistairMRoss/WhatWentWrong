@@ -133,10 +133,10 @@ export class Monitor {
       const choice = opts.metric ?? "5xx";
       const filterPattern =
         choice === "4xx"
-          ? "{ $.status >= 400 && $.status < 500 }"
+          ? '{ ($.status >= 400 && $.status < 500) || $.status = "4*" }'
           : choice === "both"
-            ? "{ $.status >= 400 }"
-            : "{ $.status >= 500 }";
+            ? '{ $.status >= 400 || $.status = "4*" || $.status = "5*" }'
+            : '{ $.status >= 500 || $.status = "5*" }';
 
       const permission = new $aws.lambda.Permission(
         `${id}AccessLogPerm`,

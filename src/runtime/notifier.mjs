@@ -90,8 +90,15 @@ function tryParseAccessLog(message) {
   if (!trimmed.startsWith("{")) return null;
   try {
     const parsed = JSON.parse(trimmed);
-    if (typeof parsed.status === "number" && parsed.status >= 400) {
-      return parsed;
+    const raw = parsed.status;
+    const status =
+      typeof raw === "number"
+        ? raw
+        : typeof raw === "string"
+          ? Number(raw)
+          : NaN;
+    if (Number.isFinite(status) && status >= 400) {
+      return { ...parsed, status };
     }
   } catch {}
   return null;

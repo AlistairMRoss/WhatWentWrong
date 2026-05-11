@@ -1,6 +1,6 @@
 {
   "name": "whatwentwrong",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "description": "Drop-in error alerting for SST v3 (ion) projects: SNS + CloudWatch alarms wired up with one .watch() call.",
   "type": "module",
   "main": "./dist/index.js",

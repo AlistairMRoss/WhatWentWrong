@@ -1,7 +1,9 @@
-import * as $aws from "@pulumi/aws";
-import * as $pulumi from "@pulumi/pulumi";
-import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
+import type * as PulumiAws from "@pulumi/aws";
+import type * as PulumiCore from "@pulumi/pulumi";
+
+declare const aws: typeof PulumiAws;
+declare const pulumi: typeof PulumiCore;
+declare const sst: any;
 
 export interface MonitorArgs {
   email?: string | string[];
@@ -17,8 +19,8 @@ export type AiConfig = AnthropicConfig;
 
 export interface AnthropicConfig {
   provider: "anthropic";
-  apiKey: $pulumi.Input<string>;
-  model?: $pulumi.Input<string>;
+  apiKey: PulumiCore.Input<string>;
+  model?: PulumiCore.Input<string>;
 }
 
 export interface WatchOptions {
@@ -28,17 +30,17 @@ export interface WatchOptions {
   metric?: "4xx" | "5xx" | "both";
 }
 
-export type Watchable = $pulumi.ComponentResource;
+export type Watchable = PulumiCore.ComponentResource;
 
 const DEFAULT_PATTERN = '?ERROR ?Exception ?"Task timed out" ?"Unhandled"';
-const HERE = dirname(fileURLToPath(import.meta.url));
-const RUNTIME_DIR = join(HERE, "runtime");
+const NOTIFIER_HANDLER_PATH =
+  "node_modules/whatwentwrong/dist/runtime/notifier.handler";
 
 export class Monitor {
-  public readonly topic: $aws.sns.Topic;
-  public readonly alarmTopic: $aws.sns.Topic;
-  public readonly notifier: $aws.lambda.Function;
-  public readonly dedupTable?: $aws.dynamodb.Table;
+  public readonly topic: PulumiAws.sns.Topic;
+  public readonly alarmTopic: PulumiAws.sns.Topic;
+  public readonly notifier: any;
+  public readonly dedupTable?: PulumiAws.dynamodb.Table;
 
   private readonly name: string;
   private readonly ai?: AiConfig;
@@ -47,8 +49,8 @@ export class Monitor {
   constructor(name: string, args: MonitorArgs = {}) {
     this.name = name;
     this.ai = args.ai;
-    this.topic = new $aws.sns.Topic(`${name}Topic`);
-    this.alarmTopic = new $aws.sns.Topic(`${name}AlarmTopic`);
+    this.topic = new aws.sns.Topic(`${name}Topic`);
+    this.alarmTopic = new aws.sns.Topic(`${name}AlarmTopic`);
 
     const emails =
       args.email == null
@@ -58,7 +60,7 @@ export class Monitor {
           : [args.email];
 
     emails.forEach((endpoint, i) => {
-      new $aws.sns.TopicSubscription(`${name}Email${i}`, {
+      new aws.sns.TopicSubscription(`${name}Email${i}`, {
         topic: this.topic.arn,
         protocol: "email",
         endpoint,
@@ -71,14 +73,14 @@ export class Monitor {
     }
     this.notifier = this.buildNotifier(this.ai, dedupCooldown);
 
-    new $aws.lambda.Permission(`${name}NotifierAlarmPerm`, {
+    new aws.lambda.Permission(`${name}NotifierAlarmPerm`, {
       action: "lambda:InvokeFunction",
       function: this.notifier.name,
       principal: "sns.amazonaws.com",
       sourceArn: this.alarmTopic.arn,
     });
 
-    new $aws.sns.TopicSubscription(`${name}NotifierAlarmSub`, {
+    new aws.sns.TopicSubscription(`${name}NotifierAlarmSub`, {
       topic: this.alarmTopic.arn,
       protocol: "lambda",
       endpoint: this.notifier.arn,
@@ -138,17 +140,17 @@ export class Monitor {
             ? '{ $.status >= 400 || $.status = "4*" || $.status = "5*" }'
             : '{ $.status >= 500 || $.status = "5*" }';
 
-      const permission = new $aws.lambda.Permission(
+      const permission = new aws.lambda.Permission(
         `${id}AccessLogPerm`,
         {
           action: "lambda:InvokeFunction",
           function: this.notifier.name,
           principal: "logs.amazonaws.com",
-          sourceArn: $pulumi.interpolate`${accessLogGroup.arn}:*`,
+          sourceArn: pulumi.interpolate`${accessLogGroup.arn}:*`,
         },
       );
 
-      new $aws.cloudwatch.LogSubscriptionFilter(
+      new aws.cloudwatch.LogSubscriptionFilter(
         `${id}AccessLogSub`,
         {
           logGroup: accessLogGroup.name,
@@ -164,7 +166,7 @@ export class Monitor {
     const metrics = choice === "both" ? ["4xx", "5xx"] : [choice];
 
     for (const metric of metrics) {
-      new $aws.cloudwatch.MetricAlarm(`${id}${metric}Alarm`, {
+      new aws.cloudwatch.MetricAlarm(`${id}${metric}Alarm`, {
         comparisonOperator: "GreaterThanOrEqualToThreshold",
         evaluationPeriods: 1,
         period: opts.period ?? 60,
@@ -187,7 +189,7 @@ export class Monitor {
       );
     }
 
-    new $aws.cloudwatch.MetricAlarm(`${id}AgeAlarm`, {
+    new aws.cloudwatch.MetricAlarm(`${id}AgeAlarm`, {
       comparisonOperator: "GreaterThanThreshold",
       evaluationPeriods: 1,
       period: opts.period ?? 60,
@@ -216,14 +218,14 @@ export class Monitor {
     logGroup: AnyResource,
     opts: WatchOptions,
   ): void {
-    const permission = new $aws.lambda.Permission(`${id}InvokeNotifier`, {
+    const permission = new aws.lambda.Permission(`${id}InvokeNotifier`, {
       action: "lambda:InvokeFunction",
       function: this.notifier.name,
       principal: "logs.amazonaws.com",
-      sourceArn: $pulumi.interpolate`${logGroup.arn}:*`,
+      sourceArn: pulumi.interpolate`${logGroup.arn}:*`,
     });
 
-    new $aws.cloudwatch.LogSubscriptionFilter(
+    new aws.cloudwatch.LogSubscriptionFilter(
       `${id}Sub`,
       {
         logGroup: logGroup.name,
@@ -234,8 +236,8 @@ export class Monitor {
     );
   }
 
-  private buildDedupTable(): $aws.dynamodb.Table {
-    return new $aws.dynamodb.Table(`${this.name}Dedup`, {
+  private buildDedupTable(): PulumiAws.dynamodb.Table {
+    return new aws.dynamodb.Table(`${this.name}Dedup`, {
       billingMode: "PAY_PER_REQUEST",
       hashKey: "fingerprint",
       attributes: [{ name: "fingerprint", type: "S" }],
@@ -246,59 +248,8 @@ export class Monitor {
   private buildNotifier(
     ai: AiConfig | undefined,
     dedupCooldown: number | null,
-  ): $aws.lambda.Function {
-    const name = this.name;
-
-    const role = new $aws.iam.Role(`${name}NotifierRole`, {
-      assumeRolePolicy: JSON.stringify({
-        Version: "2012-10-17",
-        Statement: [
-          {
-            Effect: "Allow",
-            Principal: { Service: "lambda.amazonaws.com" },
-            Action: "sts:AssumeRole",
-          },
-        ],
-      }),
-    });
-
-    new $aws.iam.RolePolicyAttachment(`${name}NotifierBasic`, {
-      role: role.name,
-      policyArn:
-        "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole",
-    });
-
-    new $aws.iam.RolePolicy(`${name}NotifierPublish`, {
-      role: role.id,
-      policy: $pulumi.jsonStringify({
-        Version: "2012-10-17",
-        Statement: [
-          {
-            Effect: "Allow",
-            Action: "sns:Publish",
-            Resource: this.topic.arn,
-          },
-        ],
-      }),
-    });
-
-    if (this.dedupTable) {
-      new $aws.iam.RolePolicy(`${name}NotifierDedup`, {
-        role: role.id,
-        policy: $pulumi.jsonStringify({
-          Version: "2012-10-17",
-          Statement: [
-            {
-              Effect: "Allow",
-              Action: ["dynamodb:UpdateItem", "dynamodb:GetItem"],
-              Resource: this.dedupTable.arn,
-            },
-          ],
-        }),
-      });
-    }
-
-    const env: Record<string, $pulumi.Input<string>> = {
+  ): any {
+    const env: Record<string, PulumiCore.Input<string>> = {
       SNS_TOPIC_ARN: this.topic.arn,
     };
     if (ai) {
@@ -310,21 +261,31 @@ export class Monitor {
       env.DEDUP_COOLDOWN = String(dedupCooldown);
     }
 
-    return new $aws.lambda.Function(`${name}Notifier`, {
+    const permissions: Array<{
+      actions: string[];
+      resources: PulumiCore.Input<string>[];
+    }> = [
+      { actions: ["sns:Publish"], resources: [this.topic.arn] },
+    ];
+    if (this.dedupTable) {
+      permissions.push({
+        actions: ["dynamodb:UpdateItem", "dynamodb:GetItem"],
+        resources: [this.dedupTable.arn],
+      });
+    }
+
+    return new sst.aws.Function(`${this.name}Notifier`, {
+      handler: NOTIFIER_HANDLER_PATH,
       runtime: "nodejs22.x",
-      handler: "notifier.handler",
-      role: role.arn,
-      timeout: 30,
-      memorySize: 256,
-      code: new $pulumi.asset.AssetArchive({
-        "notifier.mjs": new $pulumi.asset.FileAsset(
-          join(RUNTIME_DIR, "notifier.mjs"),
-        ),
-        "package.json": new $pulumi.asset.StringAsset(
-          JSON.stringify({ type: "module" }),
-        ),
-      }),
-      environment: { variables: env },
+      timeout: "30 seconds",
+      memory: "256 MB",
+      environment: env,
+      permissions,
+      nodejs: {
+        esbuild: {
+          external: ["@aws-sdk/*"],
+        },
+      },
     });
   }
 }

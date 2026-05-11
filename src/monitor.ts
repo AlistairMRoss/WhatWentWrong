@@ -25,6 +25,7 @@ export interface WatchOptions {
   pattern?: string;
   threshold?: number;
   period?: number;
+  metric?: "4xx" | "5xx" | "both";
 }
 
 export type Watchable = $pulumi.ComponentResource;
@@ -35,7 +36,8 @@ const RUNTIME_DIR = join(HERE, "runtime");
 
 export class Monitor {
   public readonly topic: $aws.sns.Topic;
-  public readonly notifier?: $aws.lambda.Function;
+  public readonly alarmTopic: $aws.sns.Topic;
+  public readonly notifier: $aws.lambda.Function;
   public readonly dedupTable?: $aws.dynamodb.Table;
 
   private readonly name: string;
@@ -46,6 +48,7 @@ export class Monitor {
     this.name = name;
     this.ai = args.ai;
     this.topic = new $aws.sns.Topic(`${name}Topic`);
+    this.alarmTopic = new $aws.sns.Topic(`${name}AlarmTopic`);
 
     const emails =
       args.email == null
@@ -62,13 +65,24 @@ export class Monitor {
       });
     });
 
-    if (this.ai) {
-      const dedupCooldown = resolveDedupCooldown(args.dedupe);
-      if (dedupCooldown != null) {
-        this.dedupTable = this.buildDedupTable();
-      }
-      this.notifier = this.buildNotifier(this.ai, dedupCooldown);
+    const dedupCooldown = resolveDedupCooldown(args.dedupe);
+    if (dedupCooldown != null) {
+      this.dedupTable = this.buildDedupTable();
     }
+    this.notifier = this.buildNotifier(this.ai, dedupCooldown);
+
+    new $aws.lambda.Permission(`${name}NotifierAlarmPerm`, {
+      action: "lambda:InvokeFunction",
+      function: this.notifier.name,
+      principal: "sns.amazonaws.com",
+      sourceArn: this.alarmTopic.arn,
+    });
+
+    new $aws.sns.TopicSubscription(`${name}NotifierAlarmSub`, {
+      topic: this.alarmTopic.arn,
+      protocol: "lambda",
+      endpoint: this.notifier.arn,
+    });
   }
 
   watch(resource: Watchable | Watchable[], opts: WatchOptions = {}): void {
@@ -91,9 +105,7 @@ export class Monitor {
       case "Cron":
         return this.watchCron(id, resource as AnyResource, opts);
       default:
-        throw new Error(
-          `Monitor.watch: unsupported resource kind "${kind}". Supported: Function, ApiGatewayV2, Queue, Cron.`,
-        );
+        throw new Error(describeUnknown(resource, kind));
     }
   }
 
@@ -105,33 +117,7 @@ export class Monitor {
       );
     }
 
-    if (this.notifier) {
-      this.subscribeNotifier(id, logGroup, opts);
-      return;
-    }
-
-    new $aws.cloudwatch.LogMetricFilter(`${id}Filter`, {
-      logGroupName: logGroup.name,
-      pattern: opts.pattern ?? DEFAULT_PATTERN,
-      metricTransformation: {
-        name: id,
-        namespace: `${this.name}/Errors`,
-        value: "1",
-        defaultValue: "0",
-      },
-    });
-
-    new $aws.cloudwatch.MetricAlarm(`${id}Alarm`, {
-      comparisonOperator: "GreaterThanOrEqualToThreshold",
-      evaluationPeriods: 1,
-      period: opts.period ?? 60,
-      threshold: opts.threshold ?? 1,
-      statistic: "Sum",
-      metricName: id,
-      namespace: `${this.name}/Errors`,
-      treatMissingData: "notBreaching",
-      alarmActions: [this.topic.arn],
-    });
+    this.subscribeNotifier(id, logGroup, opts);
   }
 
   private watchApi(id: string, api: AnyResource, opts: WatchOptions): void {
@@ -142,18 +128,55 @@ export class Monitor {
       );
     }
 
-    new $aws.cloudwatch.MetricAlarm(`${id}5xxAlarm`, {
-      comparisonOperator: "GreaterThanOrEqualToThreshold",
-      evaluationPeriods: 1,
-      period: opts.period ?? 60,
-      threshold: opts.threshold ?? 1,
-      statistic: "Sum",
-      metricName: "5xx",
-      namespace: "AWS/ApiGateway",
-      dimensions: { ApiId: apiId },
-      treatMissingData: "notBreaching",
-      alarmActions: [this.topic.arn],
-    });
+    const accessLogGroup = api?.nodes?.logGroup;
+    if (accessLogGroup) {
+      const choice = opts.metric ?? "5xx";
+      const filterPattern =
+        choice === "4xx"
+          ? "{ $.status >= 400 && $.status < 500 }"
+          : choice === "both"
+            ? "{ $.status >= 400 }"
+            : "{ $.status >= 500 }";
+
+      const permission = new $aws.lambda.Permission(
+        `${id}AccessLogPerm`,
+        {
+          action: "lambda:InvokeFunction",
+          function: this.notifier.name,
+          principal: "logs.amazonaws.com",
+          sourceArn: $pulumi.interpolate`${accessLogGroup.arn}:*`,
+        },
+      );
+
+      new $aws.cloudwatch.LogSubscriptionFilter(
+        `${id}AccessLogSub`,
+        {
+          logGroup: accessLogGroup.name,
+          filterPattern,
+          destinationArn: this.notifier.arn,
+        },
+        { dependsOn: [permission] },
+      );
+      return;
+    }
+
+    const choice = opts.metric ?? "5xx";
+    const metrics = choice === "both" ? ["4xx", "5xx"] : [choice];
+
+    for (const metric of metrics) {
+      new $aws.cloudwatch.MetricAlarm(`${id}${metric}Alarm`, {
+        comparisonOperator: "GreaterThanOrEqualToThreshold",
+        evaluationPeriods: 1,
+        period: opts.period ?? 60,
+        threshold: opts.threshold ?? 1,
+        statistic: "Sum",
+        metricName: metric,
+        namespace: "AWS/ApiGateway",
+        dimensions: { ApiId: apiId },
+        treatMissingData: "notBreaching",
+        alarmActions: [this.alarmTopic.arn],
+      });
+    }
   }
 
   private watchQueue(id: string, queue: AnyResource, opts: WatchOptions): void {
@@ -174,7 +197,7 @@ export class Monitor {
       namespace: "AWS/SQS",
       dimensions: { QueueName: queueName },
       treatMissingData: "notBreaching",
-      alarmActions: [this.topic.arn],
+      alarmActions: [this.alarmTopic.arn],
     });
   }
 
@@ -193,11 +216,9 @@ export class Monitor {
     logGroup: AnyResource,
     opts: WatchOptions,
   ): void {
-    const notifier = this.notifier!;
-
     const permission = new $aws.lambda.Permission(`${id}InvokeNotifier`, {
       action: "lambda:InvokeFunction",
-      function: notifier.name,
+      function: this.notifier.name,
       principal: "logs.amazonaws.com",
       sourceArn: $pulumi.interpolate`${logGroup.arn}:*`,
     });
@@ -207,7 +228,7 @@ export class Monitor {
       {
         logGroup: logGroup.name,
         filterPattern: opts.pattern ?? DEFAULT_PATTERN,
-        destinationArn: notifier.arn,
+        destinationArn: this.notifier.arn,
       },
       { dependsOn: [permission] },
     );
@@ -223,7 +244,7 @@ export class Monitor {
   }
 
   private buildNotifier(
-    ai: AiConfig,
+    ai: AiConfig | undefined,
     dedupCooldown: number | null,
   ): $aws.lambda.Function {
     const name = this.name;
@@ -279,9 +300,11 @@ export class Monitor {
 
     const env: Record<string, $pulumi.Input<string>> = {
       SNS_TOPIC_ARN: this.topic.arn,
-      ANTHROPIC_API_KEY: ai.apiKey,
-      ANTHROPIC_MODEL: ai.model ?? "claude-haiku-4-5",
     };
+    if (ai) {
+      env.ANTHROPIC_API_KEY = ai.apiKey;
+      env.ANTHROPIC_MODEL = ai.model ?? "claude-haiku-4-5";
+    }
     if (this.dedupTable && dedupCooldown != null) {
       env.DEDUP_TABLE = this.dedupTable.name;
       env.DEDUP_COOLDOWN = String(dedupCooldown);
@@ -317,7 +340,33 @@ function resolveDedupCooldown(
 type AnyResource = { nodes?: Record<string, any> } & Record<string, any>;
 
 function detectKind(resource: unknown): string {
-  const t =
-    (resource as { __pulumiType?: string } | undefined)?.__pulumiType ?? "";
-  return t.split(":").pop() ?? "";
+  if (!resource || typeof resource !== "object") return "";
+  const obj = resource as Record<string, any>;
+
+  const t = obj.__pulumiType;
+  if (typeof t === "string" && t.length > 0) {
+    return t.split(":").pop() ?? "";
+  }
+
+  const ctorName = obj.constructor?.name;
+  if (typeof ctorName === "string" && ctorName !== "Object") {
+    return ctorName;
+  }
+
+  return "";
+}
+
+function describeUnknown(resource: unknown, kind: string): string {
+  if (!resource || typeof resource !== "object") {
+    return `Monitor.watch: expected an SST resource, got ${typeof resource}. Supported: Function, ApiGatewayV2, Queue, Cron.`;
+  }
+  const obj = resource as Record<string, any>;
+  const ctor = obj.constructor?.name ?? "<unknown>";
+  const pt = obj.__pulumiType;
+  const keys = Object.keys(obj).slice(0, 12).join(", ");
+  return (
+    `Monitor.watch: could not identify resource ` +
+    `(kind="${kind}", constructor="${ctor}", __pulumiType=${JSON.stringify(pt)}, keys=[${keys}]). ` +
+    `Supported: Function, ApiGatewayV2, Queue, Cron.`
+  );
 }

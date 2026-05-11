@@ -28,6 +28,15 @@ const SYSTEM_PROMPT =
 export const handler = async (event) => {
   if (!TOPIC_ARN) throw new Error("SNS_TOPIC_ARN env var is required");
 
+  if (event?.awslogs?.data) {
+    return await handleLogs(event);
+  }
+  if (Array.isArray(event?.Records) && event.Records[0]?.Sns) {
+    return await handleAlarm(event.Records[0].Sns);
+  }
+};
+
+async function handleLogs(event) {
   const payload = JSON.parse(
     gunzipSync(Buffer.from(event.awslogs.data, "base64")).toString("utf-8"),
   );
@@ -38,6 +47,12 @@ export const handler = async (event) => {
 
   const first = logEvents[0];
   const count = logEvents.length;
+
+  const accessLog = tryParseAccessLog(first.message);
+  if (accessLog) {
+    return await handleAccessLog(logGroup, accessLog, count);
+  }
+
   const fp = fingerprint(first.message);
 
   let silencedCount = 0;
@@ -56,22 +71,119 @@ export const handler = async (event) => {
     }
   }
 
-  await sns.send(
-    new PublishCommand({
-      TopicArn: TOPIC_ARN,
-      Subject: subjectFor(logGroup, first.message),
-      Message: bodyFor({
-        logGroup,
-        logStream,
-        count,
-        first,
-        analysis,
-        fingerprint: fp,
-        silencedCount,
-      }),
+  await publish({
+    subject: subjectForLog(logGroup, first.message),
+    body: bodyForLog({
+      logGroup,
+      logStream,
+      count,
+      first,
+      analysis,
+      fingerprint: fp,
+      silencedCount,
     }),
-  );
-};
+  });
+}
+
+function tryParseAccessLog(message) {
+  const trimmed = message.trim();
+  if (!trimmed.startsWith("{")) return null;
+  try {
+    const parsed = JSON.parse(trimmed);
+    if (typeof parsed.status === "number" && parsed.status >= 400) {
+      return parsed;
+    }
+  } catch {}
+  return null;
+}
+
+async function handleAccessLog(logGroup, entry, count) {
+  const route = entry.routeKey || `${entry.httpMethod ?? "?"} ${entry.path ?? "?"}`;
+  const status = entry.status;
+  const detail =
+    entry.integrationErrorMessage ||
+    entry.errorMessage ||
+    entry.responseLatency != null
+      ? `${entry.integrationErrorMessage ?? ""}`.trim()
+      : "";
+
+  const fpKey = `${logGroup}|${route}|${status}`;
+  const fp = createHash("sha256").update(fpKey).digest("hex").slice(0, 16);
+
+  let silencedCount = 0;
+  if (DEDUP_TABLE) {
+    const claim = await tryClaimAlert(fp, count);
+    if (claim.suppressed) return;
+    silencedCount = claim.silencedDuringCooldown;
+  }
+
+  const time = entry.requestTime
+    ? entry.requestTime
+    : new Date().toISOString();
+
+  const lines = [
+    `Time: ${time}`,
+    `Route: ${route}`,
+    `Status: ${status}`,
+  ];
+  if (detail) lines.push(`Detail: ${detail}`);
+  if (entry.requestId) lines.push(`Request ID: ${entry.requestId}`);
+  if (silencedCount > 0) {
+    lines.push(
+      `Recurring: ${silencedCount} occurrences silenced during cooldown.`,
+    );
+  }
+
+  await publish({
+    subject: `[Alert] ${route}: ${status}`,
+    body: lines.join("\n"),
+  });
+}
+
+async function handleAlarm(snsRecord) {
+  let alarm;
+  try {
+    alarm = JSON.parse(snsRecord.Message);
+  } catch {
+    return;
+  }
+  if (alarm?.NewStateValue !== "ALARM") return;
+
+  const resource = resourceFromAlarmName(alarm.AlarmName);
+  const metricName = alarm?.Trigger?.MetricName ?? "metric";
+  const namespace = alarm?.Trigger?.Namespace ?? "";
+  const errorLabel = describeMetric(namespace, metricName);
+  const time = alarm?.StateChangeTime
+    ? new Date(alarm.StateChangeTime).toISOString()
+    : new Date().toISOString();
+
+  const lines = [
+    `Time: ${time}`,
+    `Resource: ${resource}`,
+    `Error: ${errorLabel}`,
+  ];
+
+  await publish({
+    subject: `[Alert] ${resource}: ${errorLabel}`,
+    body: lines.join("\n"),
+  });
+}
+
+function resourceFromAlarmName(alarmName) {
+  if (!alarmName) return "unknown";
+  const noHash = alarmName.replace(/-[a-f0-9]{6,}$/, "");
+  const noSuffix = noHash.replace(/(4xx|5xx|Age|Errors?)?Alarm$/, "");
+  const match = noSuffix.match(/Watch\d+(.+)$/);
+  if (match?.[1]) return match[1];
+  return noSuffix;
+}
+
+function describeMetric(namespace, metricName) {
+  if (namespace === "AWS/ApiGateway") return `HTTP ${metricName}`;
+  if (namespace === "AWS/SQS" && metricName === "ApproximateAgeOfOldestMessage")
+    return "queue backlog (oldest message too old)";
+  return metricName;
+}
 
 function fingerprint(message) {
   const lines = message.split("\n");
@@ -172,15 +284,13 @@ async function analyze(errorText) {
   return block?.text?.trim() ?? "(no analysis returned)";
 }
 
-function subjectFor(logGroup, message) {
+function subjectForLog(logGroup, message) {
   const fn = logGroup.split("/").pop() ?? logGroup;
   const firstLine = message.split("\n")[0].slice(0, 60);
-  return `[Alert] ${fn}: ${firstLine}`
-    .replace(/[^\x20-\x7e]/g, "?")
-    .slice(0, 100);
+  return `[Alert] ${fn}: ${firstLine}`;
 }
 
-function bodyFor({
+function bodyForLog({
   logGroup,
   logStream,
   count,
@@ -207,4 +317,14 @@ function bodyFor({
   if (analysis) lines.push("", "ANALYSIS", "────────", analysis);
   lines.push("", "LOGS", "────", logsUrl);
   return lines.join("\n");
+}
+
+async function publish({ subject, body }) {
+  await sns.send(
+    new PublishCommand({
+      TopicArn: TOPIC_ARN,
+      Subject: subject.replace(/[^\x20-\x7e]/g, "?").slice(0, 100),
+      Message: body,
+    }),
+  );
 }

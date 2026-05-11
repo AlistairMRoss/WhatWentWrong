@@ -20,8 +20,6 @@ Peer dependencies (already in any SST v3 project): `sst`, `@pulumi/aws`, `@pulum
 ## Quickstart
 
 ```ts
-import { Monitor } from "whatwentwrong";
-
 export default $config({
   app(input) {
     return {
@@ -31,6 +29,8 @@ export default $config({
     };
   },
   async run() {
+    const { Monitor } = await import("whatwentwrong");
+
     const alerts = new Monitor("Alerts", {
       email: "you@example.com",
     });
@@ -50,6 +50,8 @@ export default $config({
   },
 });
 ```
+
+**Heads up — dynamic import is required.** SST v3 disallows top-level imports in `sst.config.ts`, so always load this package via `await import("whatwentwrong")` inside `run()`. A top-level `import { Monitor } from "whatwentwrong"` will fail with "top level imports — this is not allowed."
 
 After your first `sst deploy`, AWS sends a confirmation email to each address you subscribed. Click the link once — alerts start landing immediately.
 

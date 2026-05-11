@@ -2,8 +2,11 @@ import type * as PulumiAws from "@pulumi/aws";
 import type * as PulumiCore from "@pulumi/pulumi";
 
 declare const aws: typeof PulumiAws;
-declare const pulumi: typeof PulumiCore;
 declare const sst: any;
+declare const $interpolate: (
+  strings: TemplateStringsArray,
+  ...values: any[]
+) => PulumiCore.Output<string>;
 
 export interface MonitorArgs {
   email?: string | string[];
@@ -146,7 +149,7 @@ export class Monitor {
           action: "lambda:InvokeFunction",
           function: this.notifier.name,
           principal: "logs.amazonaws.com",
-          sourceArn: pulumi.interpolate`${accessLogGroup.arn}:*`,
+          sourceArn: $interpolate`${accessLogGroup.arn}:*`,
         },
       );
 
@@ -222,7 +225,7 @@ export class Monitor {
       action: "lambda:InvokeFunction",
       function: this.notifier.name,
       principal: "logs.amazonaws.com",
-      sourceArn: pulumi.interpolate`${logGroup.arn}:*`,
+      sourceArn: $interpolate`${logGroup.arn}:*`,
     });
 
     new aws.cloudwatch.LogSubscriptionFilter(

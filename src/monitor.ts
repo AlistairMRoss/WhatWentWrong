@@ -233,7 +233,9 @@ export class Monitor {
         { dependsOn: [permission] },
       );
 
-      this.autoWatchApiRoutes(id, api, opts);
+      // Upload source bundles for route metadata, but skip Lambda log subscriptions —
+      // the access log subscription already covers API errors, avoiding duplicate alerts.
+      this.autoWatchApiRoutes(id, api, opts, false);
       return;
     }
 
@@ -262,13 +264,14 @@ export class Monitor {
     id: string,
     api: AnyResource,
     opts: WatchOptions,
+    subscribeToLogs = true,
   ): void {
     const tracked = routesByApi.get(api as object);
     let routeIdx = 0;
     if (tracked) {
       for (const { route, handlerArg } of tracked) {
         routeIdx += 1;
-        this.watchRoute(`${id}AutoRoute${routeIdx}`, route, opts, handlerArg);
+        this.watchRoute(`${id}AutoRoute${routeIdx}`, route, opts, handlerArg, subscribeToLogs);
       }
     }
 
@@ -281,7 +284,7 @@ export class Monitor {
       (api as any).route = function (...routeArgs: any[]) {
         const route = existingRoute(...routeArgs);
         routeIdx += 1;
-        monitor.watchRoute(`${id}AutoRoute${routeIdx}`, route, opts, routeArgs[1]);
+        monitor.watchRoute(`${id}AutoRoute${routeIdx}`, route, opts, routeArgs[1], subscribeToLogs);
         return route;
       };
     }
@@ -319,7 +322,7 @@ export class Monitor {
     this.watchFunction(id, fn, opts);
   }
 
-  private watchRoute(id: string, route: AnyResource, opts: WatchOptions, handlerArg?: any): void {
+  private watchRoute(id: string, route: AnyResource, opts: WatchOptions, handlerArg?: any, subscribeToLogs = true): void {
     const fnOutput = route?.nodes?.function;
     if (!fnOutput) {
       throw new Error(
@@ -331,22 +334,24 @@ export class Monitor {
     const logGroupName = fnOut.apply((fn: any) => fn.nodes.logGroup.name);
     const logGroupArn = fnOut.apply((fn: any) => fn.nodes.logGroup.arn);
 
-    const permission = new aws.lambda.Permission(`${id}InvokeNotifier`, {
-      action: "lambda:InvokeFunction",
-      function: this.notifier.name,
-      principal: "logs.amazonaws.com",
-      sourceArn: pulumi.interpolate`${logGroupArn}:*`,
-    });
+    if (subscribeToLogs) {
+      const permission = new aws.lambda.Permission(`${id}InvokeNotifier`, {
+        action: "lambda:InvokeFunction",
+        function: this.notifier.name,
+        principal: "logs.amazonaws.com",
+        sourceArn: pulumi.interpolate`${logGroupArn}:*`,
+      });
 
-    new aws.cloudwatch.LogSubscriptionFilter(
-      `${id}Sub`,
-      {
-        logGroup: logGroupName,
-        filterPattern: opts.pattern ?? DEFAULT_PATTERN,
-        destinationArn: this.notifier.arn,
-      },
-      { dependsOn: [permission] },
-    );
+      new aws.cloudwatch.LogSubscriptionFilter(
+        `${id}Sub`,
+        {
+          logGroup: logGroupName,
+          filterPattern: opts.pattern ?? DEFAULT_PATTERN,
+          destinationArn: this.notifier.arn,
+        },
+        { dependsOn: [permission] },
+      );
+    }
 
     if (this.sourceContextEnabled && this.sourceBucket) {
       const bundleContent = buildSourceBundle(id, handlerArg);

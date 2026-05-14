@@ -152,7 +152,13 @@ function tryParseAccessLog(message: string): AccessLog | null {
   if (!trimmed.startsWith("{")) return null;
   try {
     const parsed = JSON.parse(trimmed);
-    const raw = parsed.status;
+    // API Gateway access log formats often wrap values in literal quote characters
+    // (e.g. routeKey: '"GET /v1/test"'). Strip them so key lookups match.
+    const normalized: Record<string, any> = {};
+    for (const [k, v] of Object.entries(parsed)) {
+      normalized[k] = typeof v === "string" ? v.replace(/^"|"$/g, "") : v;
+    }
+    const raw = normalized.status;
     const status =
       typeof raw === "number"
         ? raw
@@ -160,7 +166,7 @@ function tryParseAccessLog(message: string): AccessLog | null {
           ? Number(raw)
           : NaN;
     if (Number.isFinite(status) && status >= 400) {
-      return { ...parsed, status };
+      return { ...normalized, status };
     }
   } catch {}
   return null;
@@ -307,21 +313,26 @@ async function getRouteMetadata(
 
   try {
     const encoded = Buffer.from(routeKey).toString("base64url");
+    const s3Key = `routes/${encoded}.json`;
+    console.log(`[whatwentwrong] getRouteMetadata: bucket=${SOURCE_BUCKET} key=${s3Key} (routeKey=${JSON.stringify(routeKey)})`);
     const result = await s3.send(
       new GetObjectCommand({
         Bucket: SOURCE_BUCKET,
-        Key: `routes/${encoded}.json`,
+        Key: s3Key,
       }),
     );
     if (!result.Body) {
+      console.log(`[whatwentwrong] getRouteMetadata: no body returned for ${s3Key}`);
       routeMetaCache.set(routeKey, null);
       return null;
     }
     const text = await result.Body.transformToString();
     const meta = JSON.parse(text);
+    console.log(`[whatwentwrong] getRouteMetadata: found handler=${meta.handler} sourceBundleKey=${meta.sourceBundleKey}`);
     routeMetaCache.set(routeKey, meta);
     return meta;
-  } catch {
+  } catch (err: any) {
+    console.log(`[whatwentwrong] getRouteMetadata: fetch failed for routeKey=${JSON.stringify(routeKey)} — ${err?.message ?? err}`);
     routeMetaCache.set(routeKey, null);
     return null;
   }
@@ -331,19 +342,23 @@ async function getSourceBundle(key: string): Promise<SourceBundle | null> {
   if (!SOURCE_BUCKET) return null;
   if (sourceBundleCache.has(key)) return sourceBundleCache.get(key) ?? null;
 
+  console.log(`[whatwentwrong] getSourceBundle: bucket=${SOURCE_BUCKET} key=${key}`);
   try {
     const result = await s3.send(
       new GetObjectCommand({ Bucket: SOURCE_BUCKET, Key: key }),
     );
     if (!result.Body) {
+      console.log(`[whatwentwrong] getSourceBundle: no body returned for ${key}`);
       sourceBundleCache.set(key, null);
       return null;
     }
     const text = await result.Body.transformToString();
     const bundle = JSON.parse(text) as SourceBundle;
+    console.log(`[whatwentwrong] getSourceBundle: loaded ${Object.keys(bundle.files).length} files (handlerFile=${bundle.handlerFile})`);
     sourceBundleCache.set(key, bundle);
     return bundle;
-  } catch {
+  } catch (err: any) {
+    console.log(`[whatwentwrong] getSourceBundle: fetch failed for ${key} — ${err?.message ?? err}`);
     sourceBundleCache.set(key, null);
     return null;
   }

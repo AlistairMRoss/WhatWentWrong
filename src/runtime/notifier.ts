@@ -110,7 +110,7 @@ async function handleLogs(event: AwsLogsEvent) {
 
   let bundle: SourceBundle | null = null;
   if (SOURCE_BUCKET) {
-    bundle = await getSourceBundle(`${logGroup}.json`);
+    bundle = await getSourceBundle(logGroup.replace(/^\/+/, "") + ".json");
   }
 
   const enrichedMessage = bundle

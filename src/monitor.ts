@@ -189,7 +189,7 @@ export class Monitor {
 
     new aws.s3.BucketObjectv2(`${id}SourceBundle`, {
       bucket: this.sourceBucket.bucket,
-      key: $interpolate`${logGroup.name}.json`,
+      key: $interpolate`${logGroup.name}`.apply((n: string) => `${n.replace(/^\/+/, "")}.json`),
       content: bundleContent,
       contentType: "application/json",
     });
@@ -355,7 +355,7 @@ export class Monitor {
 
     if (this.sourceContextEnabled && this.sourceBucket) {
       const bundleContent = buildSourceBundle(id, handlerArg);
-      const sourceBundleKey = pulumi.interpolate`${logGroupName}.json`;
+      const sourceBundleKey = logGroupName.apply((n: string) => `${n.replace(/^\/+/, "")}.json`);
 
       new aws.s3.BucketObjectv2(`${id}SourceBundle`, {
         bucket: this.sourceBucket.bucket,
@@ -460,6 +460,10 @@ export class Monitor {
       permissions.push({
         actions: ["s3:GetObject"],
         resources: [$interpolate`${this.sourceBucket.arn}/*`],
+      });
+      permissions.push({
+        actions: ["s3:ListBucket"],
+        resources: [this.sourceBucket.arn],
       });
     }
 

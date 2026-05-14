@@ -69,32 +69,38 @@ After your first `sst deploy`, AWS sends a confirmation email to each address yo
 | ------------------------------ | -------------------------------------------- | ------------------------ |
 | `sst.aws.Function`             | CloudWatch Logs match on `ERROR`, `Exception`, `Task timed out`, `Unhandled` | 1+ in any 60s window     |
 | `sst.aws.Cron`                 | Same as Function (watches the underlying handler)                            | 1+ in any 60s window     |
-| `sst.aws.ApiGatewayV2`         | Access logs if enabled (per-request `4xx`/`5xx`); otherwise the API Gateway metric | 1+ in any 60s window |
-| `sst.aws.ApiGatewayV2LambdaRoute` (returned by `api.route(...)`) | The route's backing function logs — full stack trace + source-map enrichment | 1+ in any 60s window |
-| `sst.aws.Queue` (SQS)          | `ApproximateAgeOfOldestMessage`                                              | greater than 300 seconds |
+| `sst.aws.ApiGatewayV2`         | Access logs if enabled (per-request `4xx`/`5xx`); otherwise the API Gateway metric. **Every route attached to the API is auto-watched** — its own function-log path (stack trace) and source-map enrichment activate without any extra code. | 1+ in any 60s window |
+| `sst.aws.Queue` (SQS)          | `ApproximateAgeOfOldestMessage`              | greater than 300 seconds |
 
-For an API Gateway 5xx, you usually want both:
+### How API Gateway gets full AI context automatically
 
 ```ts
+const alerts = new Monitor("Alerts", {
+  email: "you@example.com",
+  ai: { provider: "anthropic" },
+  sourceMap: true,
+});
+
 const api = new sst.aws.ApiGatewayV2("Api");
+api.route("GET /v1/test", "src/handlers/test.handler");
+api.route("POST /v1/migrate", "src/handlers/auth/migrate.handler");
 
-const testRoute = api.route("GET /v1/test", "src/handlers/test.handler");
-
-alerts.watch([api, testRoute]);
+alerts.watch([api]);   // ← watches the API and every route attached to it
 ```
 
-- Watching `api` gives you per-request access-log alerts (route, status, requestId) — the AI sees the access log JSON.
-- Watching the **route** subscribes to the backing function's own log group, so the alert carries the actual stack trace and (with `sourceMap: true`) gets resolved back to the original source. This is how the AI ends up reasoning about the real handler code rather than just "GET /v1/test returned 500".
+`Monitor` patches `sst.aws.ApiGatewayV2.prototype.route` the first time you construct one, so every `api.route(...)` (and any helper that calls it, like a custom `addAuthRoute`) is recorded. When you call `alerts.watch(api)`:
 
-To watch many routes at once, capture them and spread:
+- The API's access log gets a subscription filter for 4xx/5xx (or the API Gateway metric if access logs are disabled).
+- Every route's **backing function log group** gets a subscription too — so a real stack trace flows in when the function logs the error.
+- With `sourceMap: true`, each route's source map is uploaded keyed by the function's log group, **plus** a route → source-map index file is written. The notifier uses the index on access-log alerts to pull the handler's original source out of the source map's `sourcesContent` and feed it to the AI — so the AI reasons about the actual handler code even if the function silently swallowed the error.
+
+**Important caveat** — for a stack trace to appear, the function has to log the error. If your handler does:
 
 ```ts
-const routes = [
-  api.route("GET /v1/test", "src/handlers/test.handler"),
-  api.route("POST /v1/migrate", "src/handlers/auth/migrate.handler"),
-];
-alerts.watch([api, ...routes]);
+try { ... } catch (err) { return { statusCode: 500, ... } }
 ```
+
+CloudWatch sees nothing (no `ERROR`/`Exception` keyword to match). The function-log path can't fire. The access-log path still fires, and with `sourceMap: true` the AI gets the handler source — but the most informative alerts come from `console.error(err)` in your catch block, which lets the function-log path pick up the actual stack trace.
 
 Anything else throws at deploy time with a clear error.
 

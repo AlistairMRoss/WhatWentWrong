@@ -2,6 +2,7 @@ import type * as PulumiAws from "@pulumi/aws";
 import type * as PulumiCore from "@pulumi/pulumi";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { Buffer } from "node:buffer";
 
 declare const aws: typeof PulumiAws;
 declare const sst: any;
@@ -52,6 +53,24 @@ function getOrCreateApiKeySecret(): any {
   return sharedApiKeySecret;
 }
 
+const routesByApi = new WeakMap<object, any[]>();
+let apiRoutePatched = false;
+
+function ensureApiRouteTracker(): void {
+  if (apiRoutePatched) return;
+  const ApiGatewayV2 = (sst as any)?.aws?.ApiGatewayV2;
+  if (!ApiGatewayV2?.prototype?.route) return;
+  apiRoutePatched = true;
+  const origRoute = ApiGatewayV2.prototype.route;
+  ApiGatewayV2.prototype.route = function (this: object, ...args: any[]) {
+    const route = origRoute.apply(this, args);
+    const list = routesByApi.get(this) ?? [];
+    list.push(route);
+    routesByApi.set(this, list);
+    return route;
+  };
+}
+
 export class Monitor {
   public readonly topic: PulumiAws.sns.Topic;
   public readonly alarmTopic: PulumiAws.sns.Topic;
@@ -66,6 +85,7 @@ export class Monitor {
   private counter = 0;
 
   constructor(name: string, args: MonitorArgs = {}) {
+    ensureApiRouteTracker();
     this.name = name;
     this.ai = args.ai;
     this.sourceMapEnabled = args.sourceMap === true;
@@ -231,6 +251,8 @@ export class Monitor {
         },
         { dependsOn: [permission] },
       );
+
+      this.autoWatchApiRoutes(id, api, opts);
       return;
     }
 
@@ -250,6 +272,37 @@ export class Monitor {
         treatMissingData: "notBreaching",
         alarmActions: [this.alarmTopic.arn],
       });
+    }
+
+    this.autoWatchApiRoutes(id, api, opts);
+  }
+
+  private autoWatchApiRoutes(
+    id: string,
+    api: AnyResource,
+    opts: WatchOptions,
+  ): void {
+    const tracked = routesByApi.get(api as object);
+    let routeIdx = 0;
+    if (tracked) {
+      for (const route of tracked) {
+        routeIdx += 1;
+        this.watchRoute(`${id}AutoRoute${routeIdx}`, route, opts);
+      }
+    }
+
+    if ((api as any).__wwwAutoWatched) return;
+    (api as any).__wwwAutoWatched = true;
+
+    const monitor = this;
+    const existingRoute = (api as any).route?.bind(api);
+    if (typeof existingRoute === "function") {
+      (api as any).route = function (...args: any[]) {
+        const route = existingRoute(...args);
+        routeIdx += 1;
+        monitor.watchRoute(`${id}AutoRoute${routeIdx}`, route, opts);
+        return route;
+      };
     }
   }
 
@@ -331,10 +384,37 @@ export class Monitor {
           return fs.readFileSync(mapPath, "utf-8");
         });
 
+      const sourceMapKey = pulumi.interpolate`${logGroupName}.map`;
+
       new aws.s3.BucketObjectv2(`${id}SourceMap`, {
         bucket: this.sourceMapBucket.bucket,
-        key: pulumi.interpolate`${logGroupName}.map`,
+        key: sourceMapKey,
         content: sourceMapContent,
+        contentType: "application/json",
+      });
+
+      const routeKey = pulumi
+        .output(route?.nodes?.route)
+        .apply((r: any) => r.routeKey);
+
+      const encodedRouteKey = routeKey.apply((k: string) =>
+        Buffer.from(k).toString("base64url"),
+      );
+
+      const routeMeta = pulumi
+        .all([routeKey, handler, sourceMapKey])
+        .apply(([k, h, mk]: [string, string, string]) =>
+          JSON.stringify({
+            routeKey: k,
+            handler: h,
+            sourceMapKey: mk,
+          }),
+        );
+
+      new aws.s3.BucketObjectv2(`${id}RouteMeta`, {
+        bucket: this.sourceMapBucket.bucket,
+        key: pulumi.interpolate`routes/${encodedRouteKey}.json`,
+        content: routeMeta,
         contentType: "application/json",
       });
     }

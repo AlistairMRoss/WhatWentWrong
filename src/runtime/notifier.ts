@@ -194,9 +194,30 @@ async function handleAccessLog(
     ? entry.requestTime
     : new Date().toISOString();
 
+  let handlerPath: string | undefined;
+  let handlerSource: string | undefined;
+
+  if (SOURCE_MAP_BUCKET) {
+    const meta = await getRouteMetadata(route);
+    if (meta) {
+      handlerPath = meta.handler;
+      const consumer = await getSourceMapByKey(meta.sourceMapKey);
+      if (consumer) {
+        handlerSource = extractHandlerSource(consumer, meta.handler);
+      }
+    }
+  }
+
   let analysis = "";
   if (API_KEY) {
-    const promptText = formatAccessLogForAi({ route, status, detail, entry });
+    const promptText = formatAccessLogForAi({
+      route,
+      status,
+      detail,
+      entry,
+      handlerPath,
+      handlerSource,
+    });
     try {
       analysis = await analyze(promptText);
     } catch (err: any) {
@@ -233,11 +254,15 @@ function formatAccessLogForAi({
   status,
   detail,
   entry,
+  handlerPath,
+  handlerSource,
 }: {
   route: string;
   status: number;
   detail: string;
   entry: AccessLog;
+  handlerPath?: string;
+  handlerSource?: string;
 }): string {
   const parts = [
     `API Gateway access log entry for a failed request.`,
@@ -247,12 +272,100 @@ function formatAccessLogForAi({
   if (detail) parts.push(`Detail: ${detail}`);
   if (entry.requestId) parts.push(`Request ID: ${entry.requestId}`);
   parts.push("", "Full access log entry:", JSON.stringify(entry, null, 2));
-  parts.push(
-    "",
-    "Note: this is API Gateway's access log, not a function stack trace. " +
-      "If you cannot determine the cause from this alone, suggest the user check the backing function's logs.",
-  );
+
+  if (handlerPath && handlerSource) {
+    parts.push(
+      "",
+      `Handler backing this route: ${handlerPath}`,
+      "",
+      "Handler source code (from the deployed bundle's source map):",
+      "```",
+      handlerSource.slice(0, 6000),
+      "```",
+      "",
+      "No stack trace is available — the function likely caught the error and returned the status code from inside a try/catch. " +
+        "Reason about likely failure paths in the handler source above (uncaught throws from awaited calls, validation that returns 4xx/5xx, dependency calls that can throw) and cite specific lines.",
+    );
+  } else {
+    parts.push(
+      "",
+      "Note: this is API Gateway's access log, not a function stack trace. " +
+        "If you cannot determine the cause from this alone, suggest the user check the backing function's logs.",
+    );
+  }
   return parts.join("\n");
+}
+
+const routeMetaCache = new Map<
+  string,
+  { routeKey: string; handler: string; sourceMapKey: string } | null
+>();
+const sourceMapByKeyCache = new Map<string, SourceMapConsumer>();
+
+async function getRouteMetadata(
+  routeKey: string,
+): Promise<{ routeKey: string; handler: string; sourceMapKey: string } | null> {
+  if (!SOURCE_MAP_BUCKET) return null;
+  if (routeMetaCache.has(routeKey)) return routeMetaCache.get(routeKey) ?? null;
+
+  try {
+    const encoded = Buffer.from(routeKey).toString("base64url");
+    const result = await s3.send(
+      new GetObjectCommand({
+        Bucket: SOURCE_MAP_BUCKET,
+        Key: `routes/${encoded}.json`,
+      }),
+    );
+    if (!result.Body) {
+      routeMetaCache.set(routeKey, null);
+      return null;
+    }
+    const text = await result.Body.transformToString();
+    const meta = JSON.parse(text);
+    routeMetaCache.set(routeKey, meta);
+    return meta;
+  } catch {
+    routeMetaCache.set(routeKey, null);
+    return null;
+  }
+}
+
+async function getSourceMapByKey(
+  key: string,
+): Promise<SourceMapConsumer | null> {
+  if (!SOURCE_MAP_BUCKET) return null;
+  const cached = sourceMapByKeyCache.get(key);
+  if (cached) return cached;
+
+  try {
+    const result = await s3.send(
+      new GetObjectCommand({ Bucket: SOURCE_MAP_BUCKET, Key: key }),
+    );
+    if (!result.Body) return null;
+    const text = await result.Body.transformToString();
+    const consumer = await new SourceMapConsumer(JSON.parse(text));
+    sourceMapByKeyCache.set(key, consumer);
+    return consumer;
+  } catch {
+    return null;
+  }
+}
+
+function extractHandlerSource(
+  consumer: SourceMapConsumer,
+  handlerPath: string,
+): string | undefined {
+  const handlerFile = handlerPath.replace(/\.[^./]+$/, "");
+  const sources = (consumer as unknown as { sources: string[] }).sources;
+  if (!Array.isArray(sources)) return undefined;
+
+  for (const source of sources) {
+    if (source.includes(handlerFile)) {
+      const content = consumer.sourceContentFor(source, true);
+      return content ?? undefined;
+    }
+  }
+  return undefined;
 }
 
 async function handleAlarm(snsRecord: { Message: string }) {

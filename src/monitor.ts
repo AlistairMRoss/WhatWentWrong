@@ -1,16 +1,15 @@
 import type * as PulumiAws from "@pulumi/aws";
-import type * as PulumiCore from "@pulumi/pulumi";
+import * as pulumi from "@pulumi/pulumi";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { Buffer } from "node:buffer";
 
 declare const aws: typeof PulumiAws;
 declare const sst: any;
-declare const pulumi: typeof PulumiCore;
 declare const $interpolate: (
   strings: TemplateStringsArray,
   ...values: any[]
-) => PulumiCore.Output<string>;
+) => pulumi.Output<string>;
 
 export interface MonitorArgs {
   email?: string | string[];
@@ -27,7 +26,7 @@ export type AiConfig = AnthropicConfig;
 
 export interface AnthropicConfig {
   provider: "anthropic";
-  model?: PulumiCore.Input<string>;
+  model?: pulumi.Input<string>;
 }
 
 export interface WatchOptions {
@@ -37,7 +36,7 @@ export interface WatchOptions {
   metric?: "4xx" | "5xx" | "both";
 }
 
-export type Watchable = PulumiCore.ComponentResource;
+export type Watchable = pulumi.ComponentResource;
 
 const DEFAULT_PATTERN = '?ERROR ?Exception ?"Task timed out" ?"Unhandled"';
 const NOTIFIER_HANDLER_PATH =
@@ -456,7 +455,7 @@ export class Monitor {
     ai: AiConfig | undefined,
     dedupCooldown: number | null,
   ): any {
-    const env: Record<string, PulumiCore.Input<string>> = {
+    const env: Record<string, pulumi.Input<string>> = {
       SNS_TOPIC_ARN: this.topic.arn,
     };
     if (ai) {
@@ -473,7 +472,7 @@ export class Monitor {
 
     const permissions: Array<{
       actions: string[];
-      resources: PulumiCore.Input<string>[];
+      resources: pulumi.Input<string>[];
     }> = [
       { actions: ["sns:Publish"], resources: [this.topic.arn] },
     ];

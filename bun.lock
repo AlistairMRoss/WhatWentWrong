@@ -4,6 +4,9 @@
   "workspaces": {
     "": {
       "name": "monitor",
+      "dependencies": {
+        "source-map": "^0.6.1",
+      },
       "devDependencies": {
         "@pulumi/aws": "^6.0.0",
         "@pulumi/pulumi": "^3.0.0",

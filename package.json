@@ -1,6 +1,6 @@
 {
   "name": "whatwentwrong",
-  "version": "0.1.6",
+  "version": "0.2.0",
   "description": "Drop-in error alerting for SST v3 (ion) projects: SNS + CloudWatch alarms wired up with one .watch() call.",
   "type": "module",
   "main": "./dist/index.js",
@@ -18,9 +18,10 @@
     "LICENSE"
   ],
   "scripts": {
-    "build": "tsc && mkdir -p dist/runtime && cp src/runtime/*.mjs dist/runtime/",
+    "build": "tsc",
     "prepublishOnly": "bun run build",
-    "release": "npm version patch && npm publish --access public"
+    "release": "npm version patch && npm publish --access public",
+    "publish": "npm publish --access public"
   },
   "keywords": [
     "sst",
@@ -34,6 +35,9 @@
     "lambda"
   ],
   "license": "MIT",
+  "dependencies": {
+    "source-map": "^0.6.1"
+  },
   "peerDependencies": {
     "@pulumi/aws": "^6.0.0",
     "@pulumi/pulumi": "^3.0.0",

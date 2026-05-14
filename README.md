@@ -12,7 +12,13 @@ That's the whole minimum setup. No CloudWatch dashboards to wire, no SNS topic t
 ## Install
 
 ```bash
-bun install whatwentwrong
+npm install whatwentwrong
+# or
+pnpm add whatwentwrong
+# or
+yarn add whatwentwrong
+# or
+bun add whatwentwrong
 ```
 
 Peer dependencies (already in any SST v3 project): `sst`, `@pulumi/aws`, `@pulumi/pulumi`.
@@ -59,12 +65,36 @@ After your first `sst deploy`, AWS sends a confirmation email to each address yo
 
 `Monitor.watch()` accepts a single resource or an array. The right alarm shape is picked automatically based on the resource type.
 
-| Resource              | Signal                                       | Default trigger          |
-| --------------------- | -------------------------------------------- | ------------------------ |
-| `sst.aws.Function`    | CloudWatch Logs match on `ERROR`, `Exception`, `Task timed out`, `Unhandled` | 1+ in any 60s window     |
-| `sst.aws.Cron`        | Same as Function (watches the underlying handler)                            | 1+ in any 60s window     |
-| `sst.aws.ApiGatewayV2`| API Gateway `5xx` metric                                                     | 1+ in any 60s window     |
-| `sst.aws.Queue` (SQS) | `ApproximateAgeOfOldestMessage`                                              | greater than 300 seconds |
+| Resource                       | Signal                                       | Default trigger          |
+| ------------------------------ | -------------------------------------------- | ------------------------ |
+| `sst.aws.Function`             | CloudWatch Logs match on `ERROR`, `Exception`, `Task timed out`, `Unhandled` | 1+ in any 60s window     |
+| `sst.aws.Cron`                 | Same as Function (watches the underlying handler)                            | 1+ in any 60s window     |
+| `sst.aws.ApiGatewayV2`         | Access logs if enabled (per-request `4xx`/`5xx`); otherwise the API Gateway metric | 1+ in any 60s window |
+| `sst.aws.ApiGatewayV2LambdaRoute` (returned by `api.route(...)`) | The route's backing function logs — full stack trace + source-map enrichment | 1+ in any 60s window |
+| `sst.aws.Queue` (SQS)          | `ApproximateAgeOfOldestMessage`                                              | greater than 300 seconds |
+
+For an API Gateway 5xx, you usually want both:
+
+```ts
+const api = new sst.aws.ApiGatewayV2("Api");
+
+const testRoute = api.route("GET /v1/test", "src/handlers/test.handler");
+
+alerts.watch([api, testRoute]);
+```
+
+- Watching `api` gives you per-request access-log alerts (route, status, requestId) — the AI sees the access log JSON.
+- Watching the **route** subscribes to the backing function's own log group, so the alert carries the actual stack trace and (with `sourceMap: true`) gets resolved back to the original source. This is how the AI ends up reasoning about the real handler code rather than just "GET /v1/test returned 500".
+
+To watch many routes at once, capture them and spread:
+
+```ts
+const routes = [
+  api.route("GET /v1/test", "src/handlers/test.handler"),
+  api.route("POST /v1/migrate", "src/handlers/auth/migrate.handler"),
+];
+alerts.watch([api, ...routes]);
+```
 
 Anything else throws at deploy time with a clear error.
 
@@ -82,34 +112,38 @@ alerts.watch(api, {
 });
 ```
 
-| Option       | Applies to       | Description                                                            |
-| ------------ | ---------------- | ---------------------------------------------------------------------- |
-| `pattern`    | Function, Cron   | CloudWatch Logs filter pattern. Plain text, JSON, or quoted phrases.   |
-| `threshold`  | all              | Threshold for the alarm. Default 1 for error counts, 300 for queue age.|
-| `period`     | all              | Evaluation window in seconds. Default 60.                              |
+| Option       | Applies to            | Description                                                            |
+| ------------ | --------------------- | ---------------------------------------------------------------------- |
+| `pattern`    | Function, Cron        | CloudWatch Logs filter pattern. Plain text, JSON, or quoted phrases.   |
+| `threshold`  | all                   | Threshold for the alarm. Default 1 for error counts, 300 for queue age.|
+| `period`     | all                   | Evaluation window in seconds. Default 60.                              |
+| `metric`     | ApiGatewayV2          | One of `"4xx"`, `"5xx"`, `"both"`. Default `"5xx"`.                    |
 
 ## AI analysis (optional)
 
 Pass an `ai` config and every `Function` / `Cron` error gets analyzed by Claude. The email body includes a "Likely cause / Suggested fix" block alongside the raw error.
 
 ```ts
-const anthropicKey = new sst.Secret("AnthropicApiKey");
-
 const alerts = new Monitor("Alerts", {
   email: "you@example.com",
   ai: {
     provider: "anthropic",
-    apiKey: anthropicKey.value,
     model: "claude-haiku-4-5",
   },
 });
 ```
 
-Set the secret once per stage:
+Monitor creates the Anthropic API key secret for you, named `AiApiKey` (shared across all Monitor instances in the app). To activate AI analysis you must:
 
 ```bash
-sst secret set AnthropicApiKey sk-ant-...
+# 1. Set the secret value (per stage)
+sst secret set AiApiKey sk-ant-...
+
+# 2. Redeploy so the linked notifier Lambda picks it up
+sst deploy
 ```
+
+If you deployed before setting the secret, AI calls are silently skipped on the first deploy — the alert email's `ANALYSIS` block will say _"AI analysis skipped: AiApiKey secret has no value or is not linked"_ until you set it and redeploy.
 
 What changes when AI is enabled:
 
@@ -136,20 +170,47 @@ Tune or disable:
 ```ts
 new Monitor("Alerts", {
   email: "you@example.com",
-  ai: { provider: "anthropic", apiKey: anthropicKey.value },
+  ai: { provider: "anthropic" },
   dedupe: { cooldown: 900 },
 });
 
 new Monitor("AlertsNoDedup", {
   email: "you@example.com",
-  ai: { provider: "anthropic", apiKey: anthropicKey.value },
+  ai: { provider: "anthropic" },
   dedupe: false,
 });
 ```
 
 Default cooldown is 3600 seconds (1 hour). At that setting, a single error type produces at most 24 emails per day no matter how often it fires.
 
+## Source-map enrichment (optional)
+
+When `sourceMap: true` is set on `Monitor`, every watched `Function` / `Cron` gets its esbuild source map uploaded to a Monitor-owned S3 bucket at deploy time. The notifier fetches the map on each error, resolves bundled stack frames back to original `file:line`, pulls source snippets from `sourcesContent`, and includes both in the alert email and the AI prompt.
+
+```ts
+const alerts = new Monitor("Alerts", {
+  email: "you@example.com",
+  ai: { provider: "anthropic" },
+  sourceMap: true,
+});
+```
+
+Requirements:
+
+- The watched function must have source maps in its bundle. SST's nodejs bundler emits them when `nodejs.sourcemap: true` is set on the `sst.aws.Function` — make sure you have not disabled this.
+- Monitor reads the `.map` file out of `.sst/artifacts/` after bundling. If no matching map is found for a watched handler, deploy fails with a clear error.
+
+What changes in alert output:
+
+- A `RESOLVED (source map)` block lists the original `file:line:col` for each frame in the trace.
+- A `SOURCE` block shows ~3 lines around each resolved frame.
+- The AI prompt sees the same enriched context, so suggested fixes can cite original file paths and original lines.
+
+Cost note: one tiny S3 GET per error (cached in-memory across warm invocations). Source maps are stored once per stage, not per error.
+
 ## What an alert looks like
+
+With `ai` and `sourceMap` both enabled:
 
 ```
 Subject: [Alert] my-app-MyFunction: TypeError: Cannot read properties of un...
@@ -163,20 +224,38 @@ Fingerprint: 7c4a9b1e0f3d2a85
 ERROR
 ─────
 TypeError: Cannot read properties of undefined (reading 'foo')
-    at Object.<anonymous> (/var/task/index.js:42:13)
+    at Object.<anonymous> (/var/task/index.mjs:1:42345)
     at process.processTicksAndRejections (node:internal/process/task_queues:95:5)
+
+RESOLVED (source map)
+─────────────────────
+  at handler (src/api.ts:42:13)
+
+SOURCE
+──────
+── src/api.ts:42 ──
+    39 | export const handler = async (event) => {
+    40 |   const { body } = event;
+    41 |
+>   42 |   const value = body.foo;
+    43 |   return { statusCode: 200, body: JSON.stringify({ value }) };
+    44 | };
 
 ANALYSIS
 ────────
-Likely cause: The handler dereferences event.body.foo without first checking that event.body is defined.
-Suggested fix: Use optional chaining (event.body?.foo) or guard with `if (!event.body) return ...` at the top of the handler.
+Likely cause: src/api.ts:42 dereferences body.foo without checking that event.body is defined.
+Suggested fix: Use optional chaining (body?.foo) or guard with `if (!body) return { statusCode: 400 }` before line 42.
 
 LOGS
 ────
 https://us-east-1.console.aws.amazon.com/cloudwatch/home?region=us-east-1#logsV2:log-groups/log-group/...
 ```
 
-The `Recurring:` line only appears after a cooldown re-arm. The `ANALYSIS` block only appears when `ai` is configured.
+Each block is independent:
+
+- `Recurring:` only appears after a cooldown re-arm.
+- `RESOLVED` and `SOURCE` only appear when `sourceMap: true`.
+- `ANALYSIS` only appears when `ai` is configured.
 
 ## Cost
 
@@ -203,10 +282,10 @@ interface MonitorArgs {
   email?: string | string[];
   ai?: {
     provider: "anthropic";
-    apiKey: pulumi.Input<string>;
     model?: pulumi.Input<string>;
   };
   dedupe?: { cooldown?: number } | false;
+  sourceMap?: boolean;
 }
 
 monitor.watch(resource | resource[], opts?: WatchOptions): void;
@@ -215,16 +294,18 @@ interface WatchOptions {
   pattern?: string;
   threshold?: number;
   period?: number;
+  metric?: "4xx" | "5xx" | "both";
 }
 ```
 
-The `Monitor` instance also exposes `.topic` (the `aws.sns.Topic`), `.notifier` (the `aws.lambda.Function`, when AI is on), and `.dedupTable` (the `aws.dynamodb.Table`, when dedup is on) if you want to attach extra subscriptions or grants yourself.
+The `Monitor` instance also exposes `.topic` (the `aws.sns.Topic`), `.notifier` (the `aws.lambda.Function`, when AI is on), `.dedupTable` (the `aws.dynamodb.Table`, when dedup is on), `.apiKeySecret` (the `sst.Secret` Monitor created for the Anthropic key, when AI is on), and `.sourceMapBucket` (the `aws.s3.BucketV2` holding uploaded `.map` files, when `sourceMap: true`) if you want to attach extra subscriptions or grants yourself.
 
 ## Roadmap
 
-- v0.2: Discord webhook delivery via the same notifier Lambda.
-- v0.3: Optional rollup digest email when a long-running issue finally resolves.
-- v0.4: OpenAI provider.
+- ✅ v0.2 (shipped): Source-map enrichment — resolved stack frames + original source snippets in alerts and the AI prompt.
+- v0.3: Discord webhook delivery via the same notifier Lambda.
+- v0.4: Optional rollup digest email when a long-running issue finally resolves.
+- v0.5: OpenAI provider.
 
 ## License
 

@@ -1,8 +1,11 @@
 import type * as PulumiAws from "@pulumi/aws";
 import type * as PulumiCore from "@pulumi/pulumi";
+import * as fs from "node:fs";
+import * as path from "node:path";
 
 declare const aws: typeof PulumiAws;
 declare const sst: any;
+declare const pulumi: typeof PulumiCore;
 declare const $interpolate: (
   strings: TemplateStringsArray,
   ...values: any[]
@@ -12,6 +15,7 @@ export interface MonitorArgs {
   email?: string | string[];
   ai?: AiConfig;
   dedupe?: DedupeConfig | false;
+  sourceMap?: boolean;
 }
 
 export interface DedupeConfig {
@@ -22,7 +26,6 @@ export type AiConfig = AnthropicConfig;
 
 export interface AnthropicConfig {
   provider: "anthropic";
-  apiKey: PulumiCore.Input<string>;
   model?: PulumiCore.Input<string>;
 }
 
@@ -38,20 +41,34 @@ export type Watchable = PulumiCore.ComponentResource;
 const DEFAULT_PATTERN = '?ERROR ?Exception ?"Task timed out" ?"Unhandled"';
 const NOTIFIER_HANDLER_PATH =
   "node_modules/whatwentwrong/dist/runtime/notifier.handler";
+const AI_API_KEY_SECRET_NAME = "AiApiKey";
+
+let sharedApiKeySecret: any | undefined;
+
+function getOrCreateApiKeySecret(): any {
+  if (!sharedApiKeySecret) {
+    sharedApiKeySecret = new sst.Secret(AI_API_KEY_SECRET_NAME);
+  }
+  return sharedApiKeySecret;
+}
 
 export class Monitor {
   public readonly topic: PulumiAws.sns.Topic;
   public readonly alarmTopic: PulumiAws.sns.Topic;
   public readonly notifier: any;
   public readonly dedupTable?: PulumiAws.dynamodb.Table;
+  public readonly apiKeySecret?: any;
+  public readonly sourceMapBucket?: PulumiAws.s3.BucketV2;
 
   private readonly name: string;
   private readonly ai?: AiConfig;
+  private readonly sourceMapEnabled: boolean;
   private counter = 0;
 
   constructor(name: string, args: MonitorArgs = {}) {
     this.name = name;
     this.ai = args.ai;
+    this.sourceMapEnabled = args.sourceMap === true;
     this.topic = new aws.sns.Topic(`${name}Topic`);
     this.alarmTopic = new aws.sns.Topic(`${name}AlarmTopic`);
 
@@ -69,6 +86,16 @@ export class Monitor {
         endpoint,
       });
     });
+
+    if (this.ai) {
+      this.apiKeySecret = getOrCreateApiKeySecret();
+    }
+
+    if (this.sourceMapEnabled) {
+      this.sourceMapBucket = new aws.s3.BucketV2(`${name}SourceMaps`, {
+        forceDestroy: true,
+      });
+    }
 
     const dedupCooldown = resolveDedupCooldown(args.dedupe);
     if (dedupCooldown != null) {
@@ -105,6 +132,8 @@ export class Monitor {
         return this.watchFunction(id, resource as AnyResource, opts);
       case "ApiGatewayV2":
         return this.watchApi(id, resource as AnyResource, opts);
+      case "ApiGatewayV2LambdaRoute":
+        return this.watchRoute(id, resource as AnyResource, opts);
       case "Queue":
         return this.watchQueue(id, resource as AnyResource, opts);
       case "Cron":
@@ -123,6 +152,46 @@ export class Monitor {
     }
 
     this.subscribeNotifier(id, logGroup, opts);
+
+    if (this.sourceMapEnabled) {
+      this.uploadSourceMap(id, fn, logGroup);
+    }
+  }
+
+  private uploadSourceMap(
+    id: string,
+    fn: AnyResource,
+    logGroup: AnyResource,
+  ): void {
+    if (!this.sourceMapBucket) return;
+
+    const handler =
+      fn?.nodes?.function?.handler ?? fn?.handler;
+    if (!handler) {
+      throw new Error(
+        `Monitor.watch (${id}): could not determine handler for source-map lookup.`,
+      );
+    }
+
+    const sourceMapContent = pulumi
+      .all([fn?.nodes?.function?.arn, handler])
+      .apply(([_arn, handlerStr]: [unknown, string]) => {
+        const mapPath = findSourceMapForHandler(handlerStr);
+        if (!mapPath) {
+          throw new Error(
+            `Monitor.watch (${id}): no source map found for handler "${handlerStr}". ` +
+              `Make sure the watched function has nodejs.sourcemap: true.`,
+          );
+        }
+        return fs.readFileSync(mapPath, "utf-8");
+      });
+
+    new aws.s3.BucketObjectv2(`${id}SourceMap`, {
+      bucket: this.sourceMapBucket.bucket,
+      key: $interpolate`${logGroup.name}.map`,
+      content: sourceMapContent,
+      contentType: "application/json",
+    });
   }
 
   private watchApi(id: string, api: AnyResource, opts: WatchOptions): void {
@@ -216,6 +285,61 @@ export class Monitor {
     this.watchFunction(id, fn, opts);
   }
 
+  private watchRoute(id: string, route: AnyResource, opts: WatchOptions): void {
+    const fnOutput = route?.nodes?.function;
+    if (!fnOutput) {
+      throw new Error(
+        `Monitor.watch (${id}): no nodes.function found — is this an sst.aws.ApiGatewayV2LambdaRoute (returned from api.route())?`,
+      );
+    }
+
+    const fnOut = pulumi.output(fnOutput);
+    const logGroupName = fnOut.apply((fn: any) => fn.nodes.logGroup.name);
+    const logGroupArn = fnOut.apply((fn: any) => fn.nodes.logGroup.arn);
+
+    const permission = new aws.lambda.Permission(`${id}InvokeNotifier`, {
+      action: "lambda:InvokeFunction",
+      function: this.notifier.name,
+      principal: "logs.amazonaws.com",
+      sourceArn: pulumi.interpolate`${logGroupArn}:*`,
+    });
+
+    new aws.cloudwatch.LogSubscriptionFilter(
+      `${id}Sub`,
+      {
+        logGroup: logGroupName,
+        filterPattern: opts.pattern ?? DEFAULT_PATTERN,
+        destinationArn: this.notifier.arn,
+      },
+      { dependsOn: [permission] },
+    );
+
+    if (this.sourceMapEnabled && this.sourceMapBucket) {
+      const handler = fnOut.apply((fn: any) => fn.nodes.function.handler);
+      const fnArn = fnOut.apply((fn: any) => fn.nodes.function.arn);
+
+      const sourceMapContent = pulumi
+        .all([fnArn, handler])
+        .apply(([_arn, handlerStr]: [unknown, string]) => {
+          const mapPath = findSourceMapForHandler(handlerStr);
+          if (!mapPath) {
+            throw new Error(
+              `Monitor.watch (${id}): no source map found for handler "${handlerStr}". ` +
+                `Make sure the watched function has nodejs.sourcemap: true.`,
+            );
+          }
+          return fs.readFileSync(mapPath, "utf-8");
+        });
+
+      new aws.s3.BucketObjectv2(`${id}SourceMap`, {
+        bucket: this.sourceMapBucket.bucket,
+        key: pulumi.interpolate`${logGroupName}.map`,
+        content: sourceMapContent,
+        contentType: "application/json",
+      });
+    }
+  }
+
   private subscribeNotifier(
     id: string,
     logGroup: AnyResource,
@@ -256,12 +380,15 @@ export class Monitor {
       SNS_TOPIC_ARN: this.topic.arn,
     };
     if (ai) {
-      env.ANTHROPIC_API_KEY = ai.apiKey;
       env.ANTHROPIC_MODEL = ai.model ?? "claude-haiku-4-5";
+      env.AI_EXPECTED = "true";
     }
     if (this.dedupTable && dedupCooldown != null) {
       env.DEDUP_TABLE = this.dedupTable.name;
       env.DEDUP_COOLDOWN = String(dedupCooldown);
+    }
+    if (this.sourceMapBucket) {
+      env.SOURCE_MAP_BUCKET = this.sourceMapBucket.bucket;
     }
 
     const permissions: Array<{
@@ -276,8 +403,14 @@ export class Monitor {
         resources: [this.dedupTable.arn],
       });
     }
+    if (this.sourceMapBucket) {
+      permissions.push({
+        actions: ["s3:GetObject"],
+        resources: [$interpolate`${this.sourceMapBucket.arn}/*`],
+      });
+    }
 
-    return new sst.aws.Function(`${this.name}Notifier`, {
+    const fnArgs: Record<string, any> = {
       handler: NOTIFIER_HANDLER_PATH,
       runtime: "nodejs22.x",
       timeout: "30 seconds",
@@ -289,7 +422,12 @@ export class Monitor {
           external: ["@aws-sdk/*"],
         },
       },
-    });
+    };
+    if (this.apiKeySecret) {
+      fnArgs.link = [this.apiKeySecret];
+    }
+
+    return new sst.aws.Function(`${this.name}Notifier`, fnArgs);
   }
 }
 
@@ -318,6 +456,54 @@ function detectKind(resource: unknown): string {
   }
 
   return "";
+}
+
+function findSourceMapForHandler(handler: string): string | null {
+  const handlerWithoutExport = handler.replace(/\.[^./]+$/, "");
+  const cwd = process.cwd();
+  const handlerAbs = path.resolve(cwd, handlerWithoutExport);
+
+  const artifactsDir = path.join(cwd, ".sst", "artifacts");
+  if (!fs.existsSync(artifactsDir)) return null;
+
+  for (const mapPath of walkMapFiles(artifactsDir)) {
+    try {
+      const map = JSON.parse(fs.readFileSync(mapPath, "utf-8"));
+      const sources: unknown = map.sources;
+      if (!Array.isArray(sources)) continue;
+      const mapDir = path.dirname(mapPath);
+      const matches = sources.some((s) => {
+        if (typeof s !== "string") return false;
+        const resolved = path.resolve(mapDir, s);
+        const noExt = resolved.replace(/\.[^./]+$/, "");
+        return noExt === handlerAbs;
+      });
+      if (matches) return mapPath;
+    } catch {}
+  }
+  return null;
+}
+
+function* walkMapFiles(dir: string): Generator<string> {
+  let entries: fs.Dirent[];
+  try {
+    entries = fs.readdirSync(dir, { withFileTypes: true });
+  } catch {
+    return;
+  }
+  for (const entry of entries) {
+    const full = path.join(dir, entry.name);
+    if (entry.isDirectory()) {
+      yield* walkMapFiles(full);
+    } else if (
+      entry.isFile() &&
+      (full.endsWith(".js.map") ||
+        full.endsWith(".mjs.map") ||
+        full.endsWith(".cjs.map"))
+    ) {
+      yield full;
+    }
+  }
 }
 
 function describeUnknown(resource: unknown, kind: string): string {

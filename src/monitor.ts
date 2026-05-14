@@ -52,7 +52,7 @@ function getOrCreateApiKeySecret(): any {
   return sharedApiKeySecret;
 }
 
-const routesByApi = new WeakMap<object, any[]>();
+const routesByApi = new WeakMap<object, Array<{ route: any; handlerArg: any }>>();
 let apiRoutePatched = false;
 
 function ensureApiRouteTracker(): void {
@@ -64,7 +64,7 @@ function ensureApiRouteTracker(): void {
   ApiGatewayV2.prototype.route = function (this: object, ...args: any[]) {
     const route = origRoute.apply(this, args);
     const list = routesByApi.get(this) ?? [];
-    list.push(route);
+    list.push({ route, handlerArg: args[1] });
     routesByApi.set(this, list);
     return route;
   };
@@ -179,23 +179,13 @@ export class Monitor {
 
   private uploadSourceFiles(
     id: string,
-    fn: AnyResource,
+    _fn: AnyResource,
     logGroup: AnyResource,
+    handlerArg?: any,
   ): void {
     if (!this.sourceBucket) return;
 
-    const handler = fn?.nodes?.function?.handler ?? fn?.handler;
-    if (!handler) {
-      throw new Error(
-        `Monitor.watch (${id}): could not determine handler for source context.`,
-      );
-    }
-
-    const bundleContent = pulumi
-      .all([fn?.nodes?.function?.arn, handler])
-      .apply(([_arn, handlerStr]: [unknown, string]) =>
-        buildSourceBundle(id, handlerStr),
-      );
+    const bundleContent = buildSourceBundle(id, handlerArg);
 
     new aws.s3.BucketObjectv2(`${id}SourceBundle`, {
       bucket: this.sourceBucket.bucket,
@@ -276,9 +266,9 @@ export class Monitor {
     const tracked = routesByApi.get(api as object);
     let routeIdx = 0;
     if (tracked) {
-      for (const route of tracked) {
+      for (const { route, handlerArg } of tracked) {
         routeIdx += 1;
-        this.watchRoute(`${id}AutoRoute${routeIdx}`, route, opts);
+        this.watchRoute(`${id}AutoRoute${routeIdx}`, route, opts, handlerArg);
       }
     }
 
@@ -288,10 +278,10 @@ export class Monitor {
     const monitor = this;
     const existingRoute = (api as any).route?.bind(api);
     if (typeof existingRoute === "function") {
-      (api as any).route = function (...args: any[]) {
-        const route = existingRoute(...args);
+      (api as any).route = function (...routeArgs: any[]) {
+        const route = existingRoute(...routeArgs);
         routeIdx += 1;
-        monitor.watchRoute(`${id}AutoRoute${routeIdx}`, route, opts);
+        monitor.watchRoute(`${id}AutoRoute${routeIdx}`, route, opts, routeArgs[1]);
         return route;
       };
     }
@@ -329,7 +319,7 @@ export class Monitor {
     this.watchFunction(id, fn, opts);
   }
 
-  private watchRoute(id: string, route: AnyResource, opts: WatchOptions): void {
+  private watchRoute(id: string, route: AnyResource, opts: WatchOptions, handlerArg?: any): void {
     const fnOutput = route?.nodes?.function;
     if (!fnOutput) {
       throw new Error(
@@ -359,15 +349,7 @@ export class Monitor {
     );
 
     if (this.sourceContextEnabled && this.sourceBucket) {
-      const handler = fnOut.apply((fn: any) => fn.nodes.function.handler);
-      const fnArn = fnOut.apply((fn: any) => fn.nodes.function.arn);
-
-      const bundleContent = pulumi
-        .all([fnArn, handler])
-        .apply(([_arn, handlerStr]: [unknown, string]) =>
-          buildSourceBundle(id, handlerStr),
-        );
-
+      const bundleContent = buildSourceBundle(id, handlerArg);
       const sourceBundleKey = pulumi.interpolate`${logGroupName}.json`;
 
       new aws.s3.BucketObjectv2(`${id}SourceBundle`, {
@@ -385,12 +367,14 @@ export class Monitor {
         Buffer.from(k).toString("base64url"),
       );
 
+      const handlerStr = extractHandlerString(handlerArg) ?? "unknown";
+
       const routeMeta = pulumi
-        .all([routeKey, handler, sourceBundleKey])
-        .apply(([k, h, sbk]: [string, string, string]) =>
+        .all([routeKey, sourceBundleKey])
+        .apply(([k, sbk]: [string, string]) =>
           JSON.stringify({
             routeKey: k,
-            handler: h,
+            handler: handlerStr,
             sourceBundleKey: sbk,
           }),
         );
@@ -522,27 +506,51 @@ function detectKind(resource: unknown): string {
   return "";
 }
 
-function buildSourceBundle(id: string, handler: string): string {
-  const entryFile = findHandlerSourceFile(handler);
-  if (!entryFile) {
+function buildSourceBundle(id: string, handlerArg?: any): string {
+  const cwd = process.cwd();
+  const handlerStr = extractHandlerString(handlerArg);
+
+  if (handlerStr) {
+    const entryFile = findHandlerSourceFile(handlerStr);
+    if (entryFile) {
+      const allFiles = collectProjectFiles(entryFile);
+      const files: Record<string, string> = {};
+      for (const absPath of allFiles) {
+        try {
+          const rel = path.relative(cwd, absPath);
+          files[rel] = fs.readFileSync(absPath, "utf-8");
+        } catch {}
+      }
+      return JSON.stringify({ handlerFile: path.relative(cwd, entryFile), files });
+    }
+  }
+
+  // Fall back: walk the project's src/ directory
+  const srcDir = path.join(cwd, "src");
+  if (!fs.existsSync(srcDir)) {
     console.warn(
-      `[whatwentwrong] Monitor.watch (${id}): no source file found for handler "${handler}" — source context will be unavailable.`,
+      `[whatwentwrong] Monitor.watch (${id}): no src/ directory found — source context will be unavailable.`,
     );
     return JSON.stringify({ handlerFile: "", files: {} });
   }
-  const cwd = process.cwd();
-  const allFiles = collectProjectFiles(entryFile);
   const files: Record<string, string> = {};
-  for (const absPath of allFiles) {
+  for (const absPath of walkTsFiles(srcDir)) {
     try {
       const rel = path.relative(cwd, absPath);
       files[rel] = fs.readFileSync(absPath, "utf-8");
     } catch {}
   }
-  return JSON.stringify({
-    handlerFile: path.relative(cwd, entryFile),
-    files,
-  });
+  return JSON.stringify({ handlerFile: "", files });
+}
+
+function extractHandlerString(handlerArg: any): string | undefined {
+  if (typeof handlerArg === "string" && !handlerArg.startsWith("arn:")) {
+    return handlerArg;
+  }
+  if (handlerArg && typeof handlerArg === "object" && typeof handlerArg.handler === "string") {
+    return handlerArg.handler;
+  }
+  return undefined;
 }
 
 function findHandlerSourceFile(handler: string): string | null {
@@ -554,6 +562,23 @@ function findHandlerSourceFile(handler: string): string | null {
     if (fs.existsSync(candidate)) return candidate;
   }
   return null;
+}
+
+function* walkTsFiles(dir: string): Generator<string> {
+  let entries: fs.Dirent[];
+  try {
+    entries = fs.readdirSync(dir, { withFileTypes: true });
+  } catch {
+    return;
+  }
+  for (const entry of entries) {
+    const full = path.join(dir, entry.name);
+    if (entry.isDirectory() && entry.name !== "node_modules") {
+      yield* walkTsFiles(full);
+    } else if (entry.isFile() && (full.endsWith(".ts") || full.endsWith(".tsx"))) {
+      yield full;
+    }
+  }
 }
 
 function collectProjectFiles(entryFile: string): string[] {

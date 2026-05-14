@@ -15,7 +15,7 @@ export interface MonitorArgs {
   email?: string | string[];
   ai?: AiConfig;
   dedupe?: DedupeConfig | false;
-  sourceMap?: boolean;
+  sourceContext?: boolean;
 }
 
 export interface DedupeConfig {
@@ -76,18 +76,18 @@ export class Monitor {
   public readonly notifier: any;
   public readonly dedupTable?: PulumiAws.dynamodb.Table;
   public readonly apiKeySecret?: any;
-  public readonly sourceMapBucket?: PulumiAws.s3.BucketV2;
+  public readonly sourceBucket?: PulumiAws.s3.BucketV2;
 
   private readonly name: string;
   private readonly ai?: AiConfig;
-  private readonly sourceMapEnabled: boolean;
+  private readonly sourceContextEnabled: boolean;
   private counter = 0;
 
   constructor(name: string, args: MonitorArgs = {}) {
     ensureApiRouteTracker();
     this.name = name;
     this.ai = args.ai;
-    this.sourceMapEnabled = args.sourceMap === true;
+    this.sourceContextEnabled = args.sourceContext === true;
     this.topic = new aws.sns.Topic(`${name}Topic`);
     this.alarmTopic = new aws.sns.Topic(`${name}AlarmTopic`);
 
@@ -110,8 +110,8 @@ export class Monitor {
       this.apiKeySecret = getOrCreateApiKeySecret();
     }
 
-    if (this.sourceMapEnabled) {
-      this.sourceMapBucket = new aws.s3.BucketV2(`${name}SourceMaps`, {
+    if (this.sourceContextEnabled) {
+      this.sourceBucket = new aws.s3.BucketV2(`${name}Sources`, {
         forceDestroy: true,
       });
     }
@@ -172,43 +172,35 @@ export class Monitor {
 
     this.subscribeNotifier(id, logGroup, opts);
 
-    if (this.sourceMapEnabled) {
-      this.uploadSourceMap(id, fn, logGroup);
+    if (this.sourceContextEnabled) {
+      this.uploadSourceFiles(id, fn, logGroup);
     }
   }
 
-  private uploadSourceMap(
+  private uploadSourceFiles(
     id: string,
     fn: AnyResource,
     logGroup: AnyResource,
   ): void {
-    if (!this.sourceMapBucket) return;
+    if (!this.sourceBucket) return;
 
-    const handler =
-      fn?.nodes?.function?.handler ?? fn?.handler;
+    const handler = fn?.nodes?.function?.handler ?? fn?.handler;
     if (!handler) {
       throw new Error(
-        `Monitor.watch (${id}): could not determine handler for source-map lookup.`,
+        `Monitor.watch (${id}): could not determine handler for source context.`,
       );
     }
 
-    const sourceMapContent = pulumi
+    const bundleContent = pulumi
       .all([fn?.nodes?.function?.arn, handler])
-      .apply(([_arn, handlerStr]: [unknown, string]) => {
-        const mapPath = findSourceMapForHandler(handlerStr);
-        if (!mapPath) {
-          throw new Error(
-            `Monitor.watch (${id}): no source map found for handler "${handlerStr}". ` +
-              `Make sure the watched function has nodejs.sourcemap: true.`,
-          );
-        }
-        return fs.readFileSync(mapPath, "utf-8");
-      });
+      .apply(([_arn, handlerStr]: [unknown, string]) =>
+        buildSourceBundle(id, handlerStr),
+      );
 
-    new aws.s3.BucketObjectv2(`${id}SourceMap`, {
-      bucket: this.sourceMapBucket.bucket,
-      key: $interpolate`${logGroup.name}.map`,
-      content: sourceMapContent,
+    new aws.s3.BucketObjectv2(`${id}SourceBundle`, {
+      bucket: this.sourceBucket.bucket,
+      key: $interpolate`${logGroup.name}.json`,
+      content: bundleContent,
       contentType: "application/json",
     });
   }
@@ -366,29 +358,22 @@ export class Monitor {
       { dependsOn: [permission] },
     );
 
-    if (this.sourceMapEnabled && this.sourceMapBucket) {
+    if (this.sourceContextEnabled && this.sourceBucket) {
       const handler = fnOut.apply((fn: any) => fn.nodes.function.handler);
       const fnArn = fnOut.apply((fn: any) => fn.nodes.function.arn);
 
-      const sourceMapContent = pulumi
+      const bundleContent = pulumi
         .all([fnArn, handler])
-        .apply(([_arn, handlerStr]: [unknown, string]) => {
-          const mapPath = findSourceMapForHandler(handlerStr);
-          if (!mapPath) {
-            throw new Error(
-              `Monitor.watch (${id}): no source map found for handler "${handlerStr}". ` +
-                `Make sure the watched function has nodejs.sourcemap: true.`,
-            );
-          }
-          return fs.readFileSync(mapPath, "utf-8");
-        });
+        .apply(([_arn, handlerStr]: [unknown, string]) =>
+          buildSourceBundle(id, handlerStr),
+        );
 
-      const sourceMapKey = pulumi.interpolate`${logGroupName}.map`;
+      const sourceBundleKey = pulumi.interpolate`${logGroupName}.json`;
 
-      new aws.s3.BucketObjectv2(`${id}SourceMap`, {
-        bucket: this.sourceMapBucket.bucket,
-        key: sourceMapKey,
-        content: sourceMapContent,
+      new aws.s3.BucketObjectv2(`${id}SourceBundle`, {
+        bucket: this.sourceBucket.bucket,
+        key: sourceBundleKey,
+        content: bundleContent,
         contentType: "application/json",
       });
 
@@ -401,17 +386,17 @@ export class Monitor {
       );
 
       const routeMeta = pulumi
-        .all([routeKey, handler, sourceMapKey])
-        .apply(([k, h, mk]: [string, string, string]) =>
+        .all([routeKey, handler, sourceBundleKey])
+        .apply(([k, h, sbk]: [string, string, string]) =>
           JSON.stringify({
             routeKey: k,
             handler: h,
-            sourceMapKey: mk,
+            sourceBundleKey: sbk,
           }),
         );
 
       new aws.s3.BucketObjectv2(`${id}RouteMeta`, {
-        bucket: this.sourceMapBucket.bucket,
+        bucket: this.sourceBucket.bucket,
         key: pulumi.interpolate`routes/${encodedRouteKey}.json`,
         content: routeMeta,
         contentType: "application/json",
@@ -466,8 +451,8 @@ export class Monitor {
       env.DEDUP_TABLE = this.dedupTable.name;
       env.DEDUP_COOLDOWN = String(dedupCooldown);
     }
-    if (this.sourceMapBucket) {
-      env.SOURCE_MAP_BUCKET = this.sourceMapBucket.bucket;
+    if (this.sourceBucket) {
+      env.SOURCE_BUCKET = this.sourceBucket.bucket;
     }
 
     const permissions: Array<{
@@ -482,10 +467,10 @@ export class Monitor {
         resources: [this.dedupTable.arn],
       });
     }
-    if (this.sourceMapBucket) {
+    if (this.sourceBucket) {
       permissions.push({
         actions: ["s3:GetObject"],
-        resources: [$interpolate`${this.sourceMapBucket.arn}/*`],
+        resources: [$interpolate`${this.sourceBucket.arn}/*`],
       });
     }
 
@@ -537,52 +522,84 @@ function detectKind(resource: unknown): string {
   return "";
 }
 
-function findSourceMapForHandler(handler: string): string | null {
-  const handlerWithoutExport = handler.replace(/\.[^./]+$/, "");
+function buildSourceBundle(id: string, handler: string): string {
+  const entryFile = findHandlerSourceFile(handler);
+  if (!entryFile) {
+    console.warn(
+      `[whatwentwrong] Monitor.watch (${id}): no source file found for handler "${handler}" — source context will be unavailable.`,
+    );
+    return JSON.stringify({ handlerFile: "", files: {} });
+  }
   const cwd = process.cwd();
-  const handlerAbs = path.resolve(cwd, handlerWithoutExport);
-
-  const artifactsDir = path.join(cwd, ".sst", "artifacts");
-  if (!fs.existsSync(artifactsDir)) return null;
-
-  for (const mapPath of walkMapFiles(artifactsDir)) {
+  const allFiles = collectProjectFiles(entryFile);
+  const files: Record<string, string> = {};
+  for (const absPath of allFiles) {
     try {
-      const map = JSON.parse(fs.readFileSync(mapPath, "utf-8"));
-      const sources: unknown = map.sources;
-      if (!Array.isArray(sources)) continue;
-      const mapDir = path.dirname(mapPath);
-      const matches = sources.some((s) => {
-        if (typeof s !== "string") return false;
-        const resolved = path.resolve(mapDir, s);
-        const noExt = resolved.replace(/\.[^./]+$/, "");
-        return noExt === handlerAbs;
-      });
-      if (matches) return mapPath;
+      const rel = path.relative(cwd, absPath);
+      files[rel] = fs.readFileSync(absPath, "utf-8");
     } catch {}
+  }
+  return JSON.stringify({
+    handlerFile: path.relative(cwd, entryFile),
+    files,
+  });
+}
+
+function findHandlerSourceFile(handler: string): string | null {
+  const withoutExport = handler.replace(/\.[^./]+$/, "");
+  const cwd = process.cwd();
+  const base = path.resolve(cwd, withoutExport);
+  for (const ext of [".ts", ".tsx", ".js", ".mjs", ".cjs"]) {
+    const candidate = base + ext;
+    if (fs.existsSync(candidate)) return candidate;
   }
   return null;
 }
 
-function* walkMapFiles(dir: string): Generator<string> {
-  let entries: fs.Dirent[];
-  try {
-    entries = fs.readdirSync(dir, { withFileTypes: true });
-  } catch {
-    return;
-  }
-  for (const entry of entries) {
-    const full = path.join(dir, entry.name);
-    if (entry.isDirectory()) {
-      yield* walkMapFiles(full);
-    } else if (
-      entry.isFile() &&
-      (full.endsWith(".js.map") ||
-        full.endsWith(".mjs.map") ||
-        full.endsWith(".cjs.map"))
-    ) {
-      yield full;
+function collectProjectFiles(entryFile: string): string[] {
+  const cwd = process.cwd();
+  const visited = new Set<string>();
+  const queue = [entryFile];
+  while (queue.length > 0) {
+    const file = queue.shift()!;
+    if (visited.has(file)) continue;
+    visited.add(file);
+    let content: string;
+    try {
+      content = fs.readFileSync(file, "utf-8");
+    } catch {
+      continue;
+    }
+    const importRe =
+      /(?:import|export)\s[^'"]*?['"](\.[^'"]+)['"]/g;
+    const requireRe = /require\s*\(\s*['"](\.[^'"]+)['"]\s*\)/g;
+    for (const re of [importRe, requireRe]) {
+      let m: RegExpExecArray | null;
+      while ((m = re.exec(content))) {
+        const resolved = resolveImportPath(file, m[1], cwd);
+        if (resolved) queue.push(resolved);
+      }
     }
   }
+  return Array.from(visited);
+}
+
+function resolveImportPath(
+  fromFile: string,
+  importPath: string,
+  cwd: string,
+): string | null {
+  const dir = path.dirname(fromFile);
+  const abs = path.resolve(dir, importPath);
+  if (abs.includes(`${path.sep}node_modules${path.sep}`)) return null;
+  if (!abs.startsWith(cwd)) return null;
+  if (path.extname(abs)) return fs.existsSync(abs) ? abs : null;
+  for (const ext of [".ts", ".tsx", ".js", ".mjs", ".cjs"]) {
+    if (fs.existsSync(abs + ext)) return abs + ext;
+    const idx = path.join(abs, "index" + ext);
+    if (fs.existsSync(idx)) return idx;
+  }
+  return null;
 }
 
 function describeUnknown(resource: unknown, kind: string): string {

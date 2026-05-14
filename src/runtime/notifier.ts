@@ -8,7 +8,6 @@ import { gunzipSync } from "node:zlib";
 import { Buffer } from "node:buffer";
 import { createHash } from "node:crypto";
 import { Resource } from "sst";
-import { SourceMapConsumer } from "source-map";
 
 const sns = new SNSClient({});
 const ddb = new DynamoDBClient({});
@@ -20,7 +19,7 @@ const ANTHROPIC_VERSION = process.env.ANTHROPIC_VERSION || "2023-06-01";
 const REGION = process.env.AWS_REGION || "us-east-1";
 const DEDUP_TABLE = process.env.DEDUP_TABLE;
 const DEDUP_COOLDOWN = Number(process.env.DEDUP_COOLDOWN || "3600");
-const SOURCE_MAP_BUCKET = process.env.SOURCE_MAP_BUCKET;
+const SOURCE_BUCKET = process.env.SOURCE_BUCKET;
 
 const AI_EXPECTED = process.env.AI_EXPECTED === "true";
 
@@ -49,12 +48,17 @@ const API_KEY: string | undefined = (() => {
 
 const SYSTEM_PROMPT =
   "You are a debugging assistant for AWS Lambda errors. " +
-  "Given an error message, stack trace, and (when available) original source snippets at each frame, respond in this exact format:\n\n" +
+  "Given an error message, stack trace, and (when available) the full source files of the handler, respond in this exact format:\n\n" +
   "Likely cause: <one sentence>\n" +
-  "Suggested fix: <one or two sentences with concrete code or config changes, citing original file:line>\n\n" +
+  "Suggested fix: <one or two sentences with concrete code or config changes, citing the relevant file and function name>\n\n" +
   "If you cannot determine the cause from the available context, say so plainly. Do not speculate.";
 
-const sourceMapCache = new Map<string, SourceMapConsumer>();
+type SourceBundle = {
+  handlerFile: string;
+  files: Record<string, string>;
+};
+
+const sourceBundleCache = new Map<string, SourceBundle | null>();
 
 type LogEvent = { timestamp: number; message: string };
 type LogsPayload = {
@@ -104,18 +108,14 @@ async function handleLogs(event: AwsLogsEvent) {
     silencedCount = claim.silencedDuringCooldown;
   }
 
-  let resolvedFrames: ResolvedFrame[] = [];
-  if (SOURCE_MAP_BUCKET) {
-    const consumer = await getSourceMapConsumer(logGroup);
-    if (consumer) {
-      resolvedFrames = resolveStackTrace(first.message, consumer);
-    }
+  let bundle: SourceBundle | null = null;
+  if (SOURCE_BUCKET) {
+    bundle = await getSourceBundle(`${logGroup}.json`);
   }
 
-  const enrichedMessage =
-    resolvedFrames.length > 0
-      ? `${first.message}\n\nResolved (via source map):\n${formatResolvedTrace(resolvedFrames)}\n\nSource at each frame:\n${formatSnippets(resolvedFrames)}`
-      : first.message;
+  const enrichedMessage = bundle
+    ? `${first.message}\n\nSOURCE FILES\n${formatSourceContext(bundle)}`
+    : first.message;
 
   let analysis = "";
   if (API_KEY) {
@@ -140,7 +140,7 @@ async function handleLogs(event: AwsLogsEvent) {
       analysis,
       fingerprint: fp,
       silencedCount,
-      resolvedFrames,
+      sourceFiles: bundle ? Object.keys(bundle.files) : [],
     }),
   });
 }
@@ -195,15 +195,15 @@ async function handleAccessLog(
     : new Date().toISOString();
 
   let handlerPath: string | undefined;
-  let handlerSource: string | undefined;
+  let sourceContext: string | undefined;
 
-  if (SOURCE_MAP_BUCKET) {
+  if (SOURCE_BUCKET) {
     const meta = await getRouteMetadata(route);
     if (meta) {
       handlerPath = meta.handler;
-      const consumer = await getSourceMapByKey(meta.sourceMapKey);
-      if (consumer) {
-        handlerSource = extractHandlerSource(consumer, meta.handler);
+      const bundle = await getSourceBundle(meta.sourceBundleKey);
+      if (bundle) {
+        sourceContext = formatSourceContext(bundle);
       }
     }
   }
@@ -216,7 +216,7 @@ async function handleAccessLog(
       detail,
       entry,
       handlerPath,
-      handlerSource,
+      sourceContext,
     });
     try {
       analysis = await analyze(promptText);
@@ -255,14 +255,14 @@ function formatAccessLogForAi({
   detail,
   entry,
   handlerPath,
-  handlerSource,
+  sourceContext,
 }: {
   route: string;
   status: number;
   detail: string;
   entry: AccessLog;
   handlerPath?: string;
-  handlerSource?: string;
+  sourceContext?: string;
 }): string {
   const parts = [
     `API Gateway access log entry for a failed request.`,
@@ -273,18 +273,16 @@ function formatAccessLogForAi({
   if (entry.requestId) parts.push(`Request ID: ${entry.requestId}`);
   parts.push("", "Full access log entry:", JSON.stringify(entry, null, 2));
 
-  if (handlerPath && handlerSource) {
+  if (handlerPath && sourceContext) {
     parts.push(
       "",
       `Handler backing this route: ${handlerPath}`,
       "",
-      "Handler source code (from the deployed bundle's source map):",
-      "```",
-      handlerSource.slice(0, 6000),
-      "```",
+      "Source files for this handler:",
+      sourceContext,
       "",
       "No stack trace is available — the function likely caught the error and returned the status code from inside a try/catch. " +
-        "Reason about likely failure paths in the handler source above (uncaught throws from awaited calls, validation that returns 4xx/5xx, dependency calls that can throw) and cite specific lines.",
+        "Reason about likely failure paths in the handler source above (uncaught throws from awaited calls, validation that returns 4xx/5xx, dependency calls that can throw) and cite the relevant function names.",
     );
   } else {
     parts.push(
@@ -298,21 +296,20 @@ function formatAccessLogForAi({
 
 const routeMetaCache = new Map<
   string,
-  { routeKey: string; handler: string; sourceMapKey: string } | null
+  { routeKey: string; handler: string; sourceBundleKey: string } | null
 >();
-const sourceMapByKeyCache = new Map<string, SourceMapConsumer>();
 
 async function getRouteMetadata(
   routeKey: string,
-): Promise<{ routeKey: string; handler: string; sourceMapKey: string } | null> {
-  if (!SOURCE_MAP_BUCKET) return null;
+): Promise<{ routeKey: string; handler: string; sourceBundleKey: string } | null> {
+  if (!SOURCE_BUCKET) return null;
   if (routeMetaCache.has(routeKey)) return routeMetaCache.get(routeKey) ?? null;
 
   try {
     const encoded = Buffer.from(routeKey).toString("base64url");
     const result = await s3.send(
       new GetObjectCommand({
-        Bucket: SOURCE_MAP_BUCKET,
+        Bucket: SOURCE_BUCKET,
         Key: `routes/${encoded}.json`,
       }),
     );
@@ -330,42 +327,43 @@ async function getRouteMetadata(
   }
 }
 
-async function getSourceMapByKey(
-  key: string,
-): Promise<SourceMapConsumer | null> {
-  if (!SOURCE_MAP_BUCKET) return null;
-  const cached = sourceMapByKeyCache.get(key);
-  if (cached) return cached;
+async function getSourceBundle(key: string): Promise<SourceBundle | null> {
+  if (!SOURCE_BUCKET) return null;
+  if (sourceBundleCache.has(key)) return sourceBundleCache.get(key) ?? null;
 
   try {
     const result = await s3.send(
-      new GetObjectCommand({ Bucket: SOURCE_MAP_BUCKET, Key: key }),
+      new GetObjectCommand({ Bucket: SOURCE_BUCKET, Key: key }),
     );
-    if (!result.Body) return null;
+    if (!result.Body) {
+      sourceBundleCache.set(key, null);
+      return null;
+    }
     const text = await result.Body.transformToString();
-    const consumer = await new SourceMapConsumer(JSON.parse(text));
-    sourceMapByKeyCache.set(key, consumer);
-    return consumer;
+    const bundle = JSON.parse(text) as SourceBundle;
+    sourceBundleCache.set(key, bundle);
+    return bundle;
   } catch {
+    sourceBundleCache.set(key, null);
     return null;
   }
 }
 
-function extractHandlerSource(
-  consumer: SourceMapConsumer,
-  handlerPath: string,
-): string | undefined {
-  const handlerFile = handlerPath.replace(/\.[^./]+$/, "");
-  const sources = (consumer as unknown as { sources: string[] }).sources;
-  if (!Array.isArray(sources)) return undefined;
-
-  for (const source of sources) {
-    if (source.includes(handlerFile)) {
-      const content = consumer.sourceContentFor(source, true);
-      return content ?? undefined;
-    }
+function formatSourceContext(bundle: SourceBundle): string {
+  const parts: string[] = [];
+  const handlerContent = bundle.files[bundle.handlerFile];
+  if (handlerContent) {
+    parts.push(
+      `${bundle.handlerFile}:\n\`\`\`typescript\n${handlerContent.slice(0, 5000)}\n\`\`\``,
+    );
   }
-  return undefined;
+  for (const [filePath, content] of Object.entries(bundle.files)) {
+    if (filePath === bundle.handlerFile) continue;
+    parts.push(
+      `${filePath}:\n\`\`\`typescript\n${content.slice(0, 3000)}\n\`\`\``,
+    );
+  }
+  return parts.join("\n\n");
 }
 
 async function handleAlarm(snsRecord: { Message: string }) {
@@ -500,7 +498,7 @@ async function analyze(errorText: string): Promise<string> {
       messages: [
         {
           role: "user",
-          content: errorText.slice(0, 8000),
+          content: errorText.slice(0, 30000),
         },
       ],
     }),
@@ -529,7 +527,7 @@ function bodyForLog({
   analysis,
   fingerprint,
   silencedCount,
-  resolvedFrames,
+  sourceFiles,
 }: {
   logGroup: string;
   logStream: string;
@@ -538,7 +536,7 @@ function bodyForLog({
   analysis: string;
   fingerprint: string;
   silencedCount: number;
-  resolvedFrames: ResolvedFrame[];
+  sourceFiles: string[];
 }): string {
   const time = new Date(first.timestamp).toISOString();
   const logsUrl =
@@ -554,125 +552,15 @@ function bodyForLog({
     );
   }
   lines.push(`Fingerprint: ${fingerprint}`);
-  lines.push("", "ERROR", "─────", first.message.slice(0, 4000));
-  if (resolvedFrames.length > 0) {
-    lines.push(
-      "",
-      "RESOLVED (source map)",
-      "─────────────────────",
-      formatResolvedTrace(resolvedFrames),
-      "",
-      "SOURCE",
-      "──────",
-      formatSnippets(resolvedFrames),
-    );
+  if (sourceFiles.length > 0) {
+    lines.push(`Source context: ${sourceFiles.join(", ")}`);
   }
+  lines.push("", "ERROR", "─────", first.message.slice(0, 4000));
   if (analysis) lines.push("", "ANALYSIS", "────────", analysis);
   lines.push("", "LOGS", "────", logsUrl);
   return lines.join("\n");
 }
 
-interface ResolvedFrame {
-  rawFrame: string;
-  source: string;
-  line: number;
-  column: number;
-  name?: string;
-  snippet?: string;
-}
-
-async function getSourceMapConsumer(
-  logGroupName: string,
-): Promise<SourceMapConsumer | null> {
-  if (!SOURCE_MAP_BUCKET) return null;
-  const cached = sourceMapCache.get(logGroupName);
-  if (cached) return cached;
-
-  try {
-    const result = await s3.send(
-      new GetObjectCommand({
-        Bucket: SOURCE_MAP_BUCKET,
-        Key: `${logGroupName}.map`,
-      }),
-    );
-    if (!result.Body) return null;
-    const text = await result.Body.transformToString();
-    const consumer = await new SourceMapConsumer(JSON.parse(text));
-    sourceMapCache.set(logGroupName, consumer);
-    return consumer;
-  } catch {
-    return null;
-  }
-}
-
-function resolveStackTrace(
-  message: string,
-  consumer: SourceMapConsumer,
-): ResolvedFrame[] {
-  const frames: ResolvedFrame[] = [];
-  const re = /at\s+(?:\S+\s+)?\(?([^\s()]+\.m?js):(\d+):(\d+)\)?/g;
-  let match: RegExpExecArray | null;
-  while ((match = re.exec(message))) {
-    const [rawFrame, , lineStr, colStr] = match;
-    const line = parseInt(lineStr, 10);
-    const column = parseInt(colStr, 10);
-    if (!Number.isFinite(line) || !Number.isFinite(column)) continue;
-
-    const orig = consumer.originalPositionFor({ line, column });
-    if (!orig.source || !orig.line) continue;
-
-    const sourceText = consumer.sourceContentFor(orig.source, true);
-    const snippet = sourceText
-      ? extractSnippet(sourceText, orig.line, 3)
-      : undefined;
-
-    frames.push({
-      rawFrame,
-      source: orig.source,
-      line: orig.line,
-      column: orig.column ?? 0,
-      name: orig.name ?? undefined,
-      snippet,
-    });
-
-    if (frames.length >= 8) break;
-  }
-  return frames;
-}
-
-function extractSnippet(
-  source: string,
-  line: number,
-  context: number,
-): string {
-  const lines = source.split("\n");
-  const start = Math.max(0, line - context - 1);
-  const end = Math.min(lines.length, line + context);
-  return lines
-    .slice(start, end)
-    .map((l, i) => {
-      const lineNo = start + i + 1;
-      const marker = lineNo === line ? ">" : " ";
-      return `${marker} ${String(lineNo).padStart(4)} | ${l}`;
-    })
-    .join("\n");
-}
-
-function formatResolvedTrace(frames: ResolvedFrame[]): string {
-  return frames
-    .map((f) => {
-      const fnPart = f.name ? `${f.name} ` : "";
-      return `  at ${fnPart}(${f.source}:${f.line}:${f.column})`;
-    })
-    .join("\n");
-}
-
-function formatSnippets(frames: ResolvedFrame[]): string {
-  return frames
-    .filter((f) => f.snippet)
-    .map((f) => `── ${f.source}:${f.line} ──\n${f.snippet}`)
-    .join("\n\n");
-}
 
 async function publish({ subject, body }: { subject: string; body: string }) {
   await sns.send(

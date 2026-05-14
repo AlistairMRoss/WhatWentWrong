@@ -34,9 +34,7 @@
     "lambda"
   ],
   "license": "MIT",
-  "dependencies": {
-    "source-map": "^0.6.1"
-  },
+  "dependencies": {},
   "peerDependencies": {
     "@pulumi/aws": "^6.0.0",
     "@pulumi/pulumi": "^3.0.0",

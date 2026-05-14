@@ -189,7 +189,7 @@ export class Monitor {
 
     new aws.s3.BucketObjectv2(`${id}SourceBundle`, {
       bucket: this.sourceBucket.bucket,
-      key: $interpolate`${logGroup.name}`.apply((n: string) => `${n.replace(/^\/+/, "")}.json`),
+      key: $interpolate`${logGroup.name}.json`,
       content: bundleContent,
       contentType: "application/json",
     });
@@ -355,7 +355,9 @@ export class Monitor {
 
     if (this.sourceContextEnabled && this.sourceBucket) {
       const bundleContent = buildSourceBundle(id, handlerArg);
-      const sourceBundleKey = logGroupName.apply((n: string) => `${n.replace(/^\/+/, "")}.json`);
+      // Stable, slash-free key derived from the Pulumi resource ID — never changes
+      // between deploys regardless of how AWS names the log group.
+      const sourceBundleKey = `bundles/${id}.json`;
 
       new aws.s3.BucketObjectv2(`${id}SourceBundle`, {
         bucket: this.sourceBucket.bucket,
@@ -374,15 +376,13 @@ export class Monitor {
 
       const handlerStr = extractHandlerString(handlerArg) ?? "unknown";
 
-      const routeMeta = pulumi
-        .all([routeKey, sourceBundleKey])
-        .apply(([k, sbk]: [string, string]) =>
-          JSON.stringify({
-            routeKey: k,
-            handler: handlerStr,
-            sourceBundleKey: sbk,
-          }),
-        );
+      const routeMeta = routeKey.apply((k: string) =>
+        JSON.stringify({
+          routeKey: k,
+          handler: handlerStr,
+          sourceBundleKey,
+        }),
+      );
 
       new aws.s3.BucketObjectv2(`${id}RouteMeta`, {
         bucket: this.sourceBucket.bucket,

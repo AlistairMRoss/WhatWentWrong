@@ -152,8 +152,6 @@ function tryParseAccessLog(message: string): AccessLog | null {
   if (!trimmed.startsWith("{")) return null;
   try {
     const parsed = JSON.parse(trimmed);
-    // API Gateway access log formats often wrap values in literal quote characters
-    // (e.g. routeKey: '"GET /v1/test"'). Strip them so key lookups match.
     const normalized: Record<string, any> = {};
     for (const [k, v] of Object.entries(parsed)) {
       normalized[k] = typeof v === "string" ? v.replace(/^"|"$/g, "") : v;

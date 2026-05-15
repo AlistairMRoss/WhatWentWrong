@@ -309,9 +309,8 @@ The `Monitor` instance also exposes `.topic` (the `aws.sns.Topic`), `.notifier` 
 ## Roadmap
 
 - ✅ v0.2 (shipped): Source-map enrichment — resolved stack frames + original source snippets in alerts and the AI prompt.
-- v0.3: Discord webhook delivery via the same notifier Lambda.
-- v0.4: Optional rollup digest email when a long-running issue finally resolves.
-- v0.5: OpenAI provider.
+- v0.3: OpenAI provider.
+- v0.4: Discord webhook delivery via the same notifier Lambda.
 
 ## License
 

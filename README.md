@@ -160,6 +160,8 @@ What changes when AI is enabled:
 
 Default model is `claude-haiku-4-5` (cheapest, fast enough for triage). Override via `ai.model`.
 
+**Security note — prompt injection mitigation.** Log messages and access-log fields (URL paths, error messages, etc.) can contain attacker-controlled text. To prevent injected instructions from being followed by the AI, all untrusted content is wrapped in `<log_data>` tags and the system prompt explicitly instructs the model to treat everything inside those tags as raw data only, never as instructions. This follows current best-practice XML-delimiting for prompt injection defence.
+
 ## Dedup (auto-on with AI)
 
 When `ai` is set, Monitor also creates a small DynamoDB table and uses it to suppress repeat emails for the same error. Without this, a function stuck in an error loop would email you — and bill Anthropic — on every single batch.

@@ -7,3 +7,9 @@ export type {
   AnthropicConfig,
   DedupeConfig,
 } from "./monitor.js";
+export type {
+  MetricMatcher,
+  StatusClass,
+  StatusPrefix,
+  AlarmClass,
+} from "./metric.js";

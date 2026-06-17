@@ -3,6 +3,12 @@ import * as pulumi from "@pulumi/pulumi";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { Buffer } from "node:buffer";
+import {
+  buildAccessLogFilterPattern,
+  parseMetric,
+  resolveAlarmClasses,
+  type MetricMatcher,
+} from "./metric.js";
 
 declare const aws: typeof PulumiAws;
 declare const sst: any;
@@ -33,7 +39,7 @@ export interface WatchOptions {
   pattern?: string;
   threshold?: number;
   period?: number;
-  metric?: "4xx" | "5xx" | "both";
+  metric?: MetricMatcher | MetricMatcher[];
 }
 
 export type Watchable = pulumi.ComponentResource;
@@ -205,13 +211,7 @@ export class Monitor {
 
     const accessLogGroup = api?.nodes?.logGroup;
     if (accessLogGroup) {
-      const choice = opts.metric ?? "5xx";
-      const filterPattern =
-        choice === "4xx"
-          ? '{ ($.status >= 400 && $.status < 500) || $.status = "4*" }'
-          : choice === "both"
-            ? '{ $.status >= 400 || $.status = "4*" || $.status = "5*" }'
-            : '{ $.status >= 500 || $.status = "5*" }';
+      const filterPattern = buildAccessLogFilterPattern(parseMetric(opts.metric));
 
       const permission = new aws.lambda.Permission(
         `${id}AccessLogPerm`,
@@ -239,10 +239,21 @@ export class Monitor {
       return;
     }
 
-    const choice = opts.metric ?? "5xx";
-    const metrics = choice === "both" ? ["4xx", "5xx"] : [choice];
+    const { classes, widened, dropped } = resolveAlarmClasses(
+      parseMetric(opts.metric),
+    );
+    if (widened.length) {
+      pulumi.log.warn(
+        `Monitor.watch (${id}): no access logs — coarsening ${widened.join(", ")} to its status class for the CloudWatch metric alarm. Enable access logs for code-level matching.`,
+      );
+    }
+    if (dropped.length) {
+      pulumi.log.warn(
+        `Monitor.watch (${id}): no API Gateway metric for ${dropped.join(", ")}; skipped on the alarm path (enable access logs for code-level matching).`,
+      );
+    }
 
-    for (const metric of metrics) {
+    for (const metric of classes) {
       new aws.cloudwatch.MetricAlarm(`${id}${metric}Alarm`, {
         comparisonOperator: "GreaterThanOrEqualToThreshold",
         evaluationPeriods: 1,

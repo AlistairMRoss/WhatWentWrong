@@ -123,7 +123,17 @@ alerts.watch(api, {
 | `pattern`    | Function, Cron        | CloudWatch Logs filter pattern. Plain text, JSON, or quoted phrases.   |
 | `threshold`  | all                   | Threshold for the alarm. Default 1 for error counts, 300 for queue age.|
 | `period`     | all                   | Evaluation window in seconds. Default 60.                              |
-| `metric`     | ApiGatewayV2          | One of `"4xx"`, `"5xx"`, `"both"`. Default `"5xx"`.                    |
+| `metric`     | ApiGatewayV2          | A matcher or array of matchers. Default `"5xx"`. See below.            |
+
+A `metric` matcher is one of:
+
+- **Class wildcard** — `"4xx"`, `"5xx"` (any code in that hundred).
+- **Exact code** — `503`, `404`.
+- **Prefix wildcard** — `"50x"`, `"49x"` (a tens band, e.g. `500`–`509`).
+
+Pass an array to combine them: `metric: [404, "50x", "5xx"]`. With access logs enabled, every form matches exactly. On the metric-alarm path (no access logs), only the built-in API Gateway `4xx`/`5xx` count metrics exist, so exact/prefix matchers are widened to their status class (e.g. `503` → `5xx`) with a deploy-time warning — enable access logs for code-level granularity.
+
+> The previous `"both"` value is removed; use `["4xx", "5xx"]` instead.
 
 ## AI analysis (optional)
 
@@ -302,8 +312,10 @@ interface WatchOptions {
   pattern?: string;
   threshold?: number;
   period?: number;
-  metric?: "4xx" | "5xx" | "both";
+  metric?: MetricMatcher | MetricMatcher[];
 }
+
+type MetricMatcher = number | `${number}xx` | `${number}${number}x`;
 ```
 
 The `Monitor` instance also exposes `.topic` (the `aws.sns.Topic`), `.notifier` (the `aws.lambda.Function`, when AI is on), `.dedupTable` (the `aws.dynamodb.Table`, when dedup is on), `.apiKeySecret` (the `sst.Secret` Monitor created for the Anthropic key, when AI is on), and `.sourceMapBucket` (the `aws.s3.BucketV2` holding uploaded `.map` files, when `sourceMap: true`) if you want to attach extra subscriptions or grants yourself.

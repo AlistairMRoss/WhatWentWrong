@@ -19,6 +19,7 @@
   ],
   "scripts": {
     "build": "tsc",
+    "test": "bun test",
     "prepublishOnly": "bun run build",
     "release": "npm version patch && npm publish --access public"
   },

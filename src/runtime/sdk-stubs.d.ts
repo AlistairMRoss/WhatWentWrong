@@ -15,9 +15,15 @@ declare module "@aws-sdk/client-sns" {
 declare module "@aws-sdk/client-dynamodb" {
   export class DynamoDBClient {
     constructor(config: Record<string, unknown>);
-    send(command: unknown): Promise<{ Attributes?: Record<string, any> }>;
+    send(command: unknown): Promise<{
+      Attributes?: Record<string, any>;
+      Item?: Record<string, any>;
+    }>;
   }
   export class UpdateItemCommand {
+    constructor(input: Record<string, unknown>);
+  }
+  export class GetItemCommand {
     constructor(input: Record<string, unknown>);
   }
 }

@@ -1,7 +1,7 @@
 {
   "name": "whatwentwrong",
-  "version": "0.2.15",
-  "description": "Drop-in error alerting for SST v3 (ion) projects: SNS + CloudWatch alarms wired up with one .watch() call.",
+  "version": "0.3.0",
+  "description": "Drop-in error alerting for SST v3 (ion) projects: SNS + CloudWatch alarms wired up with one .watch() call, with AI error analysis and email/Slack/Discord delivery.",
   "type": "module",
   "main": "./dist/index.js",
   "module": "./dist/index.js",
@@ -14,6 +14,10 @@
     ".": {
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
+    },
+    "./capture": {
+      "types": "./dist/capture.d.ts",
+      "import": "./dist/capture.js"
     }
   },
   "files": [
@@ -24,7 +28,8 @@
   "scripts": {
     "build": "tsc",
     "test": "bun test",
-    "prepublishOnly": "bun run build",
+    "lint": "eslint .",
+    "prepublishOnly": "bun run lint && bun run build",
     "release": "npm version patch && npm publish --access public"
   },
   "keywords": [
@@ -36,7 +41,9 @@
     "sns",
     "alerting",
     "monitoring",
-    "lambda"
+    "lambda",
+    "slack",
+    "discord"
   ],
   "license": "MIT",
   "dependencies": {
@@ -48,10 +55,13 @@
     "sst": "^3.0.0"
   },
   "devDependencies": {
+    "@eslint/js": "^10.0.1",
     "@pulumi/aws": "^6.0.0",
     "@pulumi/pulumi": "^3.0.0",
     "@types/bun": "latest",
+    "eslint": "^10.8.0",
     "sst": "^3.0.0",
-    "typescript": "^5"
+    "typescript": "^5",
+    "typescript-eslint": "^8.65.0"
   }
 }

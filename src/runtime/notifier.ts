@@ -1,6 +1,7 @@
 import { SNSClient, PublishCommand } from "@aws-sdk/client-sns";
 import {
   DynamoDBClient,
+  GetItemCommand,
   UpdateItemCommand,
 } from "@aws-sdk/client-dynamodb";
 import { S3Client, GetObjectCommand } from "@aws-sdk/client-s3";
@@ -8,20 +9,110 @@ import { gunzipSync } from "node:zlib";
 import { Buffer } from "node:buffer";
 import { createHash } from "node:crypto";
 import { Resource } from "sst";
+import {
+  ANTHROPIC_API_VERSION,
+  buildAiRequest,
+  defaultModelFor,
+  isAiProviderName,
+  keyHintFor,
+  parseAiResponse,
+  type AiProviderName,
+} from "../providers.js";
+import {
+  accessLogRequestContext,
+  numberOrUndefined,
+  presentString,
+} from "../access-log.js";
+import {
+  clip,
+  policyFrom,
+  redactRecord,
+  redactStringMap,
+} from "../redact.js";
+import {
+  discordPayload,
+  renderText,
+  slackPayload,
+  subjectFor,
+  type Alert,
+  type DiscordPayload,
+  type SlackPayload,
+} from "./render.js";
+import {
+  correlate,
+  partitionLogEvents,
+  routeLabel,
+  synthesizeErrorText,
+  type RequestContext,
+} from "./request-context.js";
 
 const sns = new SNSClient({});
 const ddb = new DynamoDBClient({});
 const s3 = new S3Client({});
 
 const TOPIC_ARN = process.env.SNS_TOPIC_ARN;
-const MODEL = process.env.ANTHROPIC_MODEL || "claude-haiku-4-5";
-const ANTHROPIC_VERSION = process.env.ANTHROPIC_VERSION || "2023-06-01";
+const PROVIDER = resolveProvider(process.env.AI_PROVIDER);
+const MODEL =
+  process.env.AI_MODEL ||
+  process.env.ANTHROPIC_MODEL ||
+  defaultModelFor(PROVIDER);
+const ANTHROPIC_VERSION =
+  process.env.ANTHROPIC_VERSION || ANTHROPIC_API_VERSION;
 const REGION = process.env.AWS_REGION || "us-east-1";
 const DEDUP_TABLE = process.env.DEDUP_TABLE;
 const DEDUP_COOLDOWN = Number(process.env.DEDUP_COOLDOWN || "3600");
 const SOURCE_BUCKET = process.env.SOURCE_BUCKET;
+const SLACK_WEBHOOKS = splitWebhooks(process.env.SLACK_WEBHOOKS);
+const DISCORD_WEBHOOKS = splitWebhooks(process.env.DISCORD_WEBHOOKS);
 
 const AI_EXPECTED = process.env.AI_EXPECTED === "true";
+
+const KEY_HINT = keyHintFor(PROVIDER);
+const AI_SETUP_HINT = `Run \`sst secret set AiApiKey ${KEY_HINT}\` and redeploy.`;
+const AI_SKIPPED = `(AI analysis skipped: AiApiKey secret has no value or is not linked. ${AI_SETUP_HINT})`;
+
+const REQUEST_CONTEXT_ENABLED = process.env.REQUEST_CONTEXT !== "off";
+const REQUEST_IN_AI = process.env.REQUEST_IN_AI !== "off";
+const REQUEST_HEADERS_ENABLED = process.env.REQUEST_HEADERS !== "off";
+const REQUEST_BODY_ENABLED = process.env.REQUEST_BODY !== "off";
+const REQUEST_MARKER_TTL = 900;
+const REQUEST_POLICY = policyFrom({
+  redact:
+    process.env.REQUEST_REDACT === "off"
+      ? false
+      : splitKeys(process.env.REQUEST_REDACT_KEYS),
+  allow: splitKeys(process.env.REQUEST_ALLOW_KEYS),
+  maxBodyChars: Number(process.env.REQUEST_MAX_BODY_CHARS || "2000"),
+});
+
+const CHANNEL_ERROR_CHARS = { email: 4000, slack: 3500, discord: 800 };
+const CHANNEL_REQUEST_CHARS = { email: 4000, slack: 2000, discord: 300 };
+const CHANNEL_TOTAL_CHARS = { slack: 39000, discord: 1990 };
+
+function splitKeys(value: string | undefined): string[] {
+  if (!value) return [];
+  return value
+    .split(",")
+    .map((key) => key.trim())
+    .filter((key) => key.length > 0);
+}
+
+function resolveProvider(value: string | undefined): AiProviderName {
+  if (!value) return "anthropic";
+  if (isAiProviderName(value)) return value;
+  console.warn(
+    `[whatwentwrong] unknown AI_PROVIDER "${value}" — falling back to anthropic.`,
+  );
+  return "anthropic";
+}
+
+function splitWebhooks(value: string | undefined): string[] {
+  if (!value) return [];
+  return value
+    .split(",")
+    .map((url) => url.trim())
+    .filter((url) => url.length > 0);
+}
 
 const API_KEY: string | undefined = (() => {
   try {
@@ -30,7 +121,7 @@ const API_KEY: string | undefined = (() => {
     if (!value && AI_EXPECTED) {
       console.warn(
         "[whatwentwrong] AI is enabled in Monitor but Resource.AiApiKey has no value. " +
-          "Run `sst secret set AiApiKey sk-ant-...` and redeploy.",
+          AI_SETUP_HINT,
       );
     }
     return value || undefined;
@@ -39,7 +130,8 @@ const API_KEY: string | undefined = (() => {
       console.warn(
         "[whatwentwrong] AI is enabled in Monitor but Resource.AiApiKey is not linked: " +
           (err?.message ?? err) +
-          ". Run `sst secret set AiApiKey sk-ant-...` and redeploy.",
+          ". " +
+          AI_SETUP_HINT,
       );
     }
     return undefined;
@@ -93,15 +185,41 @@ async function handleLogs(event: AwsLogsEvent) {
   const { logGroup, logStream, logEvents } = payload;
   if (!logEvents || logEvents.length === 0) return;
 
-  const first = logEvents[0];
-  const count = logEvents.length;
+  const { errors, contexts } = partitionLogEvents(logEvents);
+  const firstError = errors[0];
+  const firstContext = contexts[0];
 
-  const accessLog = tryParseAccessLog(first.message);
-  if (accessLog) {
-    return await handleAccessLog(logGroup, accessLog, count);
+  if (firstError) {
+    const accessLog = tryParseAccessLog(firstError.message);
+    if (accessLog) {
+      return await handleAccessLog(logGroup, accessLog, errors.length);
+    }
   }
 
-  const fp = fingerprint(first.message);
+  const requestContext = REQUEST_CONTEXT_ENABLED
+    ? applyRequestPolicy(correlate(firstError, contexts))
+    : undefined;
+
+  let anchor: LogEvent;
+  let errorText: string;
+  let count: number;
+  let fp: string;
+
+  if (firstError) {
+    anchor = firstError;
+    errorText = firstError.message;
+    count = errors.length;
+    fp = fingerprint(firstError.message);
+  } else if (firstContext && requestContext) {
+    anchor = firstContext.event;
+    errorText = synthesizeErrorText(requestContext);
+    count = contexts.length;
+    fp = hashKey(
+      `${logGroup}|${routeLabel(requestContext)}|${requestContext.statusCode ?? 0}`,
+    );
+  } else {
+    return;
+  }
 
   let silencedCount = 0;
   if (DEDUP_TABLE) {
@@ -110,41 +228,79 @@ async function handleLogs(event: AwsLogsEvent) {
     silencedCount = claim.silencedDuringCooldown;
   }
 
+  if (requestContext?.requestId) {
+    await markRequestAlerted(requestContext.requestId);
+  }
+
   let bundle: SourceBundle | null = null;
   if (SOURCE_BUCKET) {
     bundle = await getSourceBundle(`${logGroup}.json`);
   }
 
-  const enrichedMessage = bundle
-    ? `${first.message}\n\nSOURCE FILES\n${formatSourceContext(bundle)}`
-    : first.message;
+  const aiParts = [errorText];
+  if (requestContext && REQUEST_IN_AI) {
+    aiParts.push("", "REQUEST CONTEXT", formatRequestContextForAi(requestContext));
+  }
+  if (bundle) {
+    aiParts.push("", "SOURCE FILES", formatSourceContext(bundle));
+  }
 
   let analysis = "";
   if (API_KEY) {
     try {
-      analysis = await analyze(enrichedMessage);
+      analysis = await analyze(aiParts.join("\n"));
     } catch (err: any) {
       analysis = `(AI analysis failed: ${err?.message ?? err})`;
     }
   } else if (AI_EXPECTED) {
-    analysis =
-      "(AI analysis skipped: AiApiKey secret has no value or is not linked. " +
-      "Run `sst secret set AiApiKey sk-ant-...` and redeploy.)";
+    analysis = AI_SKIPPED;
   }
 
-  await publish({
-    subject: subjectForLog(logGroup, first.message),
-    body: bodyForLog({
-      logGroup,
-      logStream,
-      count,
-      first,
-      analysis,
-      fingerprint: fp,
-      silencedCount,
-      sourceFiles: bundle ? Object.keys(bundle.files) : [],
-    }),
+  await deliver({
+    kind: "log",
+    logGroup,
+    logStream,
+    count,
+    timestamp: anchor.timestamp,
+    errorText,
+    analysis,
+    fingerprint: fp,
+    silencedCount,
+    sourceFiles: bundle ? Object.keys(bundle.files) : [],
+    region: REGION,
+    requestContext,
   });
+}
+
+function applyRequestPolicy(
+  ctx: RequestContext | undefined,
+): RequestContext | undefined {
+  if (!ctx) return undefined;
+  const scoped: RequestContext = { ...ctx };
+  if (!REQUEST_HEADERS_ENABLED) delete scoped.headers;
+  if (!REQUEST_BODY_ENABLED) delete scoped.body;
+  if (scoped.body) {
+    scoped.body = clip(scoped.body, REQUEST_POLICY.maxBodyChars);
+  }
+  if (scoped.headers) {
+    scoped.headers = redactStringMap(scoped.headers, REQUEST_POLICY, true);
+  }
+  if (scoped.identity) {
+    scoped.identity = redactStringMap(scoped.identity, REQUEST_POLICY, false);
+  }
+  return scoped;
+}
+
+function hashKey(key: string): string {
+  return createHash("sha256").update(key).digest("hex").slice(0, 16);
+}
+
+function formatRequestContextForAi(ctx: RequestContext): string {
+  const safe = redactRecord(
+    ctx as unknown as Record<string, unknown>,
+    REQUEST_POLICY,
+  );
+  return JSON.stringify(safe, null, 2);
 }
 
 type AccessLog = Record<string, any> & { status: number };
@@ -179,15 +335,18 @@ async function handleAccessLog(
 ) {
   const route = entry.routeKey || `${entry.httpMethod ?? "?"} ${entry.path ?? "?"}`;
   const status = entry.status;
-  const detail =
-    entry.integrationErrorMessage ||
-    entry.errorMessage ||
-    entry.responseLatency != null
-      ? `${entry.integrationErrorMessage ?? ""}`.trim()
-      : "";
+  const detail = `${entry.integrationErrorMessage ?? entry.errorMessage ?? ""}`.trim();
 
-  const fpKey = `${logGroup}|${route}|${status}`;
-  const fp = createHash("sha256").update(fpKey).digest("hex").slice(0, 16);
+  const requestId = presentString(entry.requestId);
+  if (REQUEST_CONTEXT_ENABLED && requestId && (await wasRequestAlerted(requestId))) {
+    return;
+  }
+
+  const requestContext = REQUEST_CONTEXT_ENABLED
+    ? accessLogRequestContext(entry, REQUEST_POLICY)
+    : undefined;
+
+  const fp = hashKey(`${logGroup}|${route}|${status}`);
 
   let silencedCount = 0;
   if (DEDUP_TABLE) {
@@ -230,28 +389,20 @@ async function handleAccessLog(
       analysis = `(AI analysis failed: ${err?.message ?? err})`;
     }
   } else if (AI_EXPECTED) {
-    analysis =
-      "(AI analysis skipped: AiApiKey secret has no value or is not linked. " +
-      "Run `sst secret set AiApiKey sk-ant-...` and redeploy.)";
+    analysis = AI_SKIPPED;
   }
 
-  const lines = [
-    `Time: ${time}`,
-    `Route: ${route}`,
-    `Status: ${status}`,
-  ];
-  if (detail) lines.push(`Detail: ${detail}`);
-  if (entry.requestId) lines.push(`Request ID: ${entry.requestId}`);
-  if (silencedCount > 0) {
-    lines.push(
-      `Recurring: ${silencedCount} occurrences silenced during cooldown.`,
-    );
-  }
-  if (analysis) lines.push("", "ANALYSIS", "────────", analysis);
-
-  await publish({
-    subject: `[Alert] ${route}: ${status}`,
-    body: lines.join("\n"),
+  await deliver({
+    kind: "accessLog",
+    route,
+    status,
+    time,
+    detail,
+    requestId,
+    latencyMs: numberOrUndefined(entry.responseLatency),
+    analysis,
+    silencedCount,
+    requestContext,
   });
 }
 
@@ -277,7 +428,11 @@ function formatAccessLogForAi({
   ];
   if (detail) parts.push(`Detail: ${detail}`);
   if (entry.requestId) parts.push(`Request ID: ${entry.requestId}`);
-  parts.push("", "Full access log entry:", JSON.stringify(entry, null, 2));
+  parts.push(
+    "",
+    "Full access log entry:",
+    JSON.stringify(redactRecord(entry, REQUEST_POLICY), null, 2),
+  );
 
   if (handlerPath && sourceContext) {
     parts.push(
@@ -398,16 +553,7 @@ async function handleAlarm(snsRecord: { Message: string }) {
     ? new Date(alarm.StateChangeTime).toISOString()
     : new Date().toISOString();
 
-  const lines = [
-    `Time: ${time}`,
-    `Resource: ${resource}`,
-    `Error: ${errorLabel}`,
-  ];
-
-  await publish({
-    subject: `[Alert] ${resource}: ${errorLabel}`,
-    body: lines.join("\n"),
-  });
+  await deliver({ kind: "alarm", resource, errorLabel, time });
 }
 
 function resourceFromAlarmName(alarmName: string | undefined): string {
@@ -492,98 +638,133 @@ async function tryClaimAlert(
   }
 }
 
-async function analyze(errorText: string): Promise<string> {
-  const safeContent = `<log_data>\n${errorText.slice(0, 30000)}\n</log_data>`;
-  const res = await fetch("https://api.anthropic.com/v1/messages", {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      "x-api-key": API_KEY!,
-      "anthropic-version": ANTHROPIC_VERSION,
-    },
-    body: JSON.stringify({
-      model: MODEL,
-      max_tokens: 400,
-      system: [
-        {
-          type: "text",
-          text: SYSTEM_PROMPT,
-          cache_control: { type: "ephemeral" },
+async function markRequestAlerted(requestId: string): Promise<void> {
+  if (!DEDUP_TABLE) return;
+  const nowSec = Math.floor(Date.now() / 1000);
+  try {
+    await ddb.send(
+      new UpdateItemCommand({
+        TableName: DEDUP_TABLE,
+        Key: { fingerprint: { S: requestMarkerKey(requestId) } },
+        UpdateExpression: "SET cooldownEnds = :end, lastSeen = :now",
+        ExpressionAttributeValues: {
+          ":end": { N: String(nowSec + REQUEST_MARKER_TTL) },
+          ":now": { N: String(nowSec) },
         },
-      ],
-      messages: [
-        {
-          role: "user",
-          content: safeContent,
-        },
-      ],
-    }),
-  });
-
-  if (!res.ok) {
-    throw new Error(`Anthropic API ${res.status}: ${await res.text()}`);
-  }
-
-  const data: any = await res.json();
-  const block = data?.content?.find((c: any) => c.type === "text");
-  return block?.text?.trim() ?? "(no analysis returned)";
-}
-
-function subjectForLog(logGroup: string, message: string): string {
-  const fn = logGroup.split("/").pop() ?? logGroup;
-  const firstLine = message.split("\n")[0].slice(0, 60);
-  return `[Alert] ${fn}: ${firstLine}`;
-}
-
-function bodyForLog({
-  logGroup,
-  logStream,
-  count,
-  first,
-  analysis,
-  fingerprint,
-  silencedCount,
-  sourceFiles,
-}: {
-  logGroup: string;
-  logStream: string;
-  count: number;
-  first: LogEvent;
-  analysis: string;
-  fingerprint: string;
-  silencedCount: number;
-  sourceFiles: string[];
-}): string {
-  const time = new Date(first.timestamp).toISOString();
-  const logsUrl =
-    `https://${REGION}.console.aws.amazon.com/cloudwatch/home?region=${REGION}` +
-    `#logsV2:log-groups/log-group/${encodeURIComponent(logGroup)}` +
-    `/log-events/${encodeURIComponent(logStream)}`;
-
-  const lines = [`Time: ${time}`, `Log group: ${logGroup}`];
-  if (count > 1) lines.push(`Errors in batch: ${count} (showing first)`);
-  if (silencedCount > 0) {
-    lines.push(
-      `Recurring: ${silencedCount} occurrences silenced during cooldown.`,
+      }),
+    );
+  } catch (err: any) {
+    console.warn(
+      "[whatwentwrong] could not record the request marker:",
+      err?.message ?? err,
     );
   }
-  lines.push(`Fingerprint: ${fingerprint}`);
-  if (sourceFiles.length > 0) {
-    lines.push(`Source context: ${sourceFiles.join(", ")}`);
-  }
-  lines.push("", "ERROR", "─────", first.message.slice(0, 4000));
-  if (analysis) lines.push("", "ANALYSIS", "────────", analysis);
-  lines.push("", "LOGS", "────", logsUrl);
-  return lines.join("\n");
 }
 
+async function wasRequestAlerted(requestId: string): Promise<boolean> {
+  if (!DEDUP_TABLE) return false;
+  const nowSec = Math.floor(Date.now() / 1000);
+  try {
+    const result = (await ddb.send(
+      new GetItemCommand({
+        TableName: DEDUP_TABLE,
+        Key: { fingerprint: { S: requestMarkerKey(requestId) } },
+        ConsistentRead: true,
+      }),
+    )) as { Item?: Record<string, { N?: string }> };
+    const endsAt = result.Item?.cooldownEnds?.N;
+    return endsAt != null && Number(endsAt) > nowSec;
+  } catch (err: any) {
+    console.warn(
+      "[whatwentwrong] could not read the request marker:",
+      err?.message ?? err,
+    );
+    return false;
+  }
+}
 
-async function publish({ subject, body }: { subject: string; body: string }) {
-  await sns.send(
-    new PublishCommand({
-      TopicArn: TOPIC_ARN,
-      Subject: subject.replace(/[^\x20-\x7e]/g, "?").slice(0, 100),
-      Message: body,
-    }),
-  );
+function requestMarkerKey(requestId: string): string {
+  return `req#${requestId}`;
+}
+
+async function analyze(errorText: string): Promise<string> {
+  const { url, headers, body } = buildAiRequest({
+    provider: PROVIDER,
+    model: MODEL,
+    apiKey: API_KEY!,
+    systemPrompt: SYSTEM_PROMPT,
+    userContent: `<log_data>\n${errorText.slice(0, 30000)}\n</log_data>`,
+    maxTokens: 400,
+    anthropicVersion: ANTHROPIC_VERSION,
+  });
+
+  const res = await fetch(url, { method: "POST", headers, body });
+
+  if (!res.ok) {
+    throw new Error(`${PROVIDER} API ${res.status}: ${await res.text()}`);
+  }
+
+  return parseAiResponse(PROVIDER, await res.json());
+}
+
+async function deliver(alert: Alert): Promise<void> {
+  const subject = subjectFor(alert);
+
+  const tasks: Array<Promise<unknown>> = [
+    sns.send(
+      new PublishCommand({
+        TopicArn: TOPIC_ARN,
+        Subject: subject.replace(/[^\x20-\x7e]/g, "?").slice(0, 100),
+        Message: renderText(alert, {
+          errorChars: CHANNEL_ERROR_CHARS.email,
+          requestChars: CHANNEL_REQUEST_CHARS.email,
+        }),
+      }),
+    ),
+  ];
+
+  if (SLACK_WEBHOOKS.length > 0) {
+    const payload = slackPayload(alert, {
+      errorChars: CHANNEL_ERROR_CHARS.slack,
+      requestChars: CHANNEL_REQUEST_CHARS.slack,
+      totalChars: CHANNEL_TOTAL_CHARS.slack,
+    });
+    for (const url of SLACK_WEBHOOKS) {
+      tasks.push(postWebhook(url, "slack", payload));
+    }
+  }
+
+  if (DISCORD_WEBHOOKS.length > 0) {
+    const payload = discordPayload(alert, {
+      errorChars: CHANNEL_ERROR_CHARS.discord,
+      requestChars: CHANNEL_REQUEST_CHARS.discord,
+      totalChars: CHANNEL_TOTAL_CHARS.discord,
+    });
+    for (const url of DISCORD_WEBHOOKS) {
+      tasks.push(postWebhook(url, "discord", payload));
+    }
+  }
+
+  const results = await Promise.allSettled(tasks);
+  for (const result of results) {
+    if (result.status === "rejected") {
+      console.error("[whatwentwrong] delivery failed:", result.reason);
+    }
+  }
+}
+
+async function postWebhook(
+  url: string,
+  channel: string,
+  payload: SlackPayload | DiscordPayload,
+): Promise<void> {
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  if (!res.ok) {
+    const text = (await res.text()).slice(0, 300);
+    throw new Error(`${channel} webhook ${res.status}: ${text}`);
+  }
 }

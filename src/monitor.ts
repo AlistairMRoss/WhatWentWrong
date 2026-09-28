@@ -9,6 +9,13 @@ import {
   resolveAlarmClasses,
   type MetricMatcher,
 } from "./metric.js";
+import { ANTHROPIC_API_VERSION, defaultModelFor } from "./providers.js";
+import {
+  checkWebhookUrl,
+  toList,
+  type WebhookChannel,
+} from "./channels.js";
+import { DEFAULT_MAX_BODY_CHARS } from "./redact.js";
 
 declare const aws: typeof PulumiAws;
 declare const sst: any;
@@ -19,21 +26,54 @@ declare const $interpolate: (
 
 export interface MonitorArgs {
   email?: string | string[];
+  slack?: string | string[];
+  discord?: string | string[];
   ai?: AiConfig;
   dedupe?: DedupeConfig | false;
   sourceContext?: boolean;
+  requestContext?: RequestContextConfig | false;
+}
+
+export interface RequestContextConfig {
+  headers?: boolean;
+  body?: boolean;
+  maxBodyChars?: number;
+  redact?: string[] | false;
+  allow?: string[];
+  includeInAi?: boolean;
 }
 
 export interface DedupeConfig {
   cooldown?: number;
 }
 
-export type AiConfig = AnthropicConfig;
+export type AiConfig =
+  | AnthropicConfig
+  | OpenAIConfig
+  | GrokConfig
+  | GeminiConfig;
 
 export interface AnthropicConfig {
   provider: "anthropic";
   model?: pulumi.Input<string>;
 }
+
+export interface OpenAIConfig {
+  provider: "openai";
+  model?: pulumi.Input<string>;
+}
+
+export interface GrokConfig {
+  provider: "grok";
+  model?: pulumi.Input<string>;
+}
+
+export interface GeminiConfig {
+  provider: "gemini";
+  model?: pulumi.Input<string>;
+}
+
+export type { WebhookChannel } from "./channels.js";
 
 export interface WatchOptions {
   pattern?: string;
@@ -87,6 +127,7 @@ export class Monitor {
   private readonly name: string;
   private readonly ai?: AiConfig;
   private readonly sourceContextEnabled: boolean;
+  private readonly requestContext: ResolvedRequestContext | null;
   private counter = 0;
 
   constructor(name: string, args: MonitorArgs = {}) {
@@ -94,15 +135,37 @@ export class Monitor {
     this.name = name;
     this.ai = args.ai;
     this.sourceContextEnabled = args.sourceContext === true;
+    this.requestContext = resolveRequestContext(args.requestContext);
+    if (this.requestContext && !this.requestContext.redactEnabled) {
+      pulumi.log.warn(
+        `Monitor (${name}): request context redaction is disabled — credentials, cookies and tokens will be sent verbatim to every configured channel${this.requestContext.includeInAi ? " and to your AI provider" : ""}. Remember captureRequest needs redact: false too.`,
+      );
+    }
     this.topic = new aws.sns.Topic(`${name}Topic`);
     this.alarmTopic = new aws.sns.Topic(`${name}AlarmTopic`);
 
-    const emails =
-      args.email == null
-        ? []
-        : Array.isArray(args.email)
-          ? args.email
-          : [args.email];
+    const emails = toList(args.email);
+    const slackUrls = toList(args.slack);
+    const discordUrls = toList(args.discord);
+
+    for (const url of slackUrls) {
+      const warning = checkWebhookUrl(url, "slack");
+      if (warning) pulumi.log.warn(warning);
+    }
+    for (const url of discordUrls) {
+      const warning = checkWebhookUrl(url, "discord");
+      if (warning) pulumi.log.warn(warning);
+    }
+
+    if (
+      emails.length === 0 &&
+      slackUrls.length === 0 &&
+      discordUrls.length === 0
+    ) {
+      pulumi.log.warn(
+        `Monitor (${name}): no email, slack or discord configured — alerts will be generated but delivered nowhere.`,
+      );
+    }
 
     emails.forEach((endpoint, i) => {
       new aws.sns.TopicSubscription(`${name}Email${i}`, {
@@ -125,8 +188,15 @@ export class Monitor {
     const dedupCooldown = resolveDedupCooldown(args.dedupe);
     if (dedupCooldown != null) {
       this.dedupTable = this.buildDedupTable();
+    } else if (this.requestContext) {
+      pulumi.log.warn(
+        `Monitor (${name}): requestContext is enabled but dedupe is false — a failing API Gateway route may alert twice, once from the function log and once from the access log.`,
+      );
     }
-    this.notifier = this.buildNotifier(this.ai, dedupCooldown);
+    this.notifier = this.buildNotifier(this.ai, dedupCooldown, {
+      slack: slackUrls,
+      discord: discordUrls,
+    });
 
     new aws.lambda.Permission(`${name}NotifierAlarmPerm`, {
       action: "lambda:InvokeFunction",
@@ -233,9 +303,7 @@ export class Monitor {
         { dependsOn: [permission] },
       );
 
-      // Upload source bundles for route metadata, but skip Lambda log subscriptions —
-      // the access log subscription already covers API errors, avoiding duplicate alerts.
-      this.autoWatchApiRoutes(id, api, opts, false);
+      this.autoWatchApiRoutes(id, api, opts, this.requestContext !== null);
       return;
     }
 
@@ -289,13 +357,12 @@ export class Monitor {
     if ((api as any).__wwwAutoWatched) return;
     (api as any).__wwwAutoWatched = true;
 
-    const monitor = this;
     const existingRoute = (api as any).route?.bind(api);
     if (typeof existingRoute === "function") {
-      (api as any).route = function (...routeArgs: any[]) {
+      (api as any).route = (...routeArgs: any[]) => {
         const route = existingRoute(...routeArgs);
         routeIdx += 1;
-        monitor.watchRoute(`${id}AutoRoute${routeIdx}`, route, opts, routeArgs[1], subscribeToLogs);
+        this.watchRoute(`${id}AutoRoute${routeIdx}`, route, opts, routeArgs[1], subscribeToLogs);
         return route;
       };
     }
@@ -366,8 +433,6 @@ export class Monitor {
 
     if (this.sourceContextEnabled && this.sourceBucket) {
       const bundleContent = buildSourceBundle(id, handlerArg);
-      // Stable, slash-free key derived from the Pulumi resource ID — never changes
-      // between deploys regardless of how AWS names the log group.
       const sourceBundleKey = `bundles/${id}.json`;
 
       new aws.s3.BucketObjectv2(`${id}SourceBundle`, {
@@ -439,13 +504,24 @@ export class Monitor {
   private buildNotifier(
     ai: AiConfig | undefined,
     dedupCooldown: number | null,
+    webhooks: Record<WebhookChannel, string[]>,
   ): any {
     const env: Record<string, pulumi.Input<string>> = {
       SNS_TOPIC_ARN: this.topic.arn,
     };
     if (ai) {
-      env.ANTHROPIC_MODEL = ai.model ?? "claude-haiku-4-5";
+      env.AI_PROVIDER = ai.provider;
+      env.AI_MODEL = ai.model ?? defaultModelFor(ai.provider);
       env.AI_EXPECTED = "true";
+      if (ai.provider === "anthropic") {
+        env.ANTHROPIC_VERSION = ANTHROPIC_API_VERSION;
+      }
+    }
+    if (webhooks.slack.length > 0) {
+      env.SLACK_WEBHOOKS = webhooks.slack.join(",");
+    }
+    if (webhooks.discord.length > 0) {
+      env.DISCORD_WEBHOOKS = webhooks.discord.join(",");
     }
     if (this.dedupTable && dedupCooldown != null) {
       env.DEDUP_TABLE = this.dedupTable.name;
@@ -453,6 +529,22 @@ export class Monitor {
     }
     if (this.sourceBucket) {
       env.SOURCE_BUCKET = this.sourceBucket.bucket;
+    }
+    if (this.requestContext) {
+      env.REQUEST_MAX_BODY_CHARS = String(this.requestContext.maxBodyChars);
+      env.REQUEST_IN_AI = this.requestContext.includeInAi ? "on" : "off";
+      env.REQUEST_HEADERS = this.requestContext.headers ? "on" : "off";
+      env.REQUEST_BODY = this.requestContext.body ? "on" : "off";
+      if (!this.requestContext.redactEnabled) {
+        env.REQUEST_REDACT = "off";
+      } else if (this.requestContext.redact.length > 0) {
+        env.REQUEST_REDACT_KEYS = this.requestContext.redact.join(",");
+      }
+      if (this.requestContext.allow.length > 0) {
+        env.REQUEST_ALLOW_KEYS = this.requestContext.allow.join(",");
+      }
+    } else {
+      env.REQUEST_CONTEXT = "off";
     }
 
     const permissions: Array<{
@@ -497,6 +589,32 @@ export class Monitor {
 
     return new sst.aws.Function(`${this.name}Notifier`, fnArgs);
   }
+}
+
+interface ResolvedRequestContext {
+  headers: boolean;
+  body: boolean;
+  maxBodyChars: number;
+  redactEnabled: boolean;
+  redact: string[];
+  allow: string[];
+  includeInAi: boolean;
+}
+
+function resolveRequestContext(
+  config: MonitorArgs["requestContext"],
+): ResolvedRequestContext | null {
+  if (config === false) return null;
+  const value = config ?? {};
+  return {
+    headers: value.headers !== false,
+    body: value.body !== false,
+    maxBodyChars: value.maxBodyChars ?? DEFAULT_MAX_BODY_CHARS,
+    redactEnabled: value.redact !== false,
+    redact: value.redact === false ? [] : (value.redact ?? []),
+    allow: value.allow ?? [],
+    includeInAi: value.includeInAi !== false,
+  };
 }
 
 function resolveDedupCooldown(
@@ -545,7 +663,6 @@ function buildSourceBundle(id: string, handlerArg?: any): string {
     }
   }
 
-  // Fall back: walk the project's src/ directory
   const srcDir = path.join(cwd, "src");
   if (!fs.existsSync(srcDir)) {
     console.warn(

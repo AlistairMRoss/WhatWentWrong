@@ -24,15 +24,19 @@ import {
   presentString,
 } from "../access-log.js";
 import {
+  clip,
   policyFrom,
   redactRecord,
   redactStringMap,
 } from "../redact.js";
 import {
+  discordPayload,
   renderText,
+  slackPayload,
   subjectFor,
-  webhookMessage,
   type Alert,
+  type DiscordPayload,
+  type SlackPayload,
 } from "./render.js";
 import {
   correlate,
@@ -275,6 +279,9 @@ function applyRequestPolicy(
   const scoped: RequestContext = { ...ctx };
   if (!REQUEST_HEADERS_ENABLED) delete scoped.headers;
   if (!REQUEST_BODY_ENABLED) delete scoped.body;
+  if (scoped.body) {
+    scoped.body = clip(scoped.body, REQUEST_POLICY.maxBodyChars);
+  }
   if (scoped.headers) {
     scoped.headers = redactStringMap(scoped.headers, REQUEST_POLICY, true);
   }
@@ -717,24 +724,24 @@ async function deliver(alert: Alert): Promise<void> {
   ];
 
   if (SLACK_WEBHOOKS.length > 0) {
-    const text = webhookMessage(alert, "*", {
+    const payload = slackPayload(alert, {
       errorChars: CHANNEL_ERROR_CHARS.slack,
       requestChars: CHANNEL_REQUEST_CHARS.slack,
       totalChars: CHANNEL_TOTAL_CHARS.slack,
     });
     for (const url of SLACK_WEBHOOKS) {
-      tasks.push(postWebhook(url, "slack", { text }));
+      tasks.push(postWebhook(url, "slack", payload));
     }
   }
 
   if (DISCORD_WEBHOOKS.length > 0) {
-    const content = webhookMessage(alert, "**", {
+    const payload = discordPayload(alert, {
       errorChars: CHANNEL_ERROR_CHARS.discord,
       requestChars: CHANNEL_REQUEST_CHARS.discord,
       totalChars: CHANNEL_TOTAL_CHARS.discord,
     });
     for (const url of DISCORD_WEBHOOKS) {
-      tasks.push(postWebhook(url, "discord", { content }));
+      tasks.push(postWebhook(url, "discord", payload));
     }
   }
 
@@ -749,7 +756,7 @@ async function deliver(alert: Alert): Promise<void> {
 async function postWebhook(
   url: string,
   channel: string,
-  payload: Record<string, string>,
+  payload: SlackPayload | DiscordPayload,
 ): Promise<void> {
   const res = await fetch(url, {
     method: "POST",

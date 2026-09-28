@@ -433,8 +433,6 @@ export class Monitor {
 
     if (this.sourceContextEnabled && this.sourceBucket) {
       const bundleContent = buildSourceBundle(id, handlerArg);
-      // Stable, slash-free key derived from the Pulumi resource ID — never changes
-      // between deploys regardless of how AWS names the log group.
       const sourceBundleKey = `bundles/${id}.json`;
 
       new aws.s3.BucketObjectv2(`${id}SourceBundle`, {
@@ -665,7 +663,6 @@ function buildSourceBundle(id: string, handlerArg?: any): string {
     }
   }
 
-  // Fall back: walk the project's src/ directory
   const srcDir = path.join(cwd, "src");
   if (!fs.existsSync(srcDir)) {
     console.warn(

@@ -91,7 +91,7 @@ alerts.watch([api]);   // ← watches the API and every route attached to it
 `Monitor` patches `sst.aws.ApiGatewayV2.prototype.route` the first time you construct one, so every `api.route(...)` (and any helper that calls it, like a custom `addAuthRoute`) is recorded. When you call `alerts.watch(api)`:
 
 - The API's access log gets a subscription filter for 4xx/5xx (or the API Gateway metric if access logs are disabled).
-- Every route's **backing function log group** gets a subscription too — so a real stack trace flows in when the function logs the error.
+- Every route's **backing function log group** gets a subscription too — so a real stack trace flows in when the function logs the error. This requires request context to be enabled (the default); with `requestContext: false` only the access-log path is subscribed, so route alerts carry no stack trace.
 - With `sourceContext: true`, each route's handler source (plus its import graph) is uploaded, **plus** a route → bundle index file is written. The notifier uses the index on access-log alerts to pull the handler's original source and feed it to the AI — so the AI reasons about the actual handler code even if the function silently swallowed the error.
 
 **Important caveat** — for a stack trace to appear, the function has to log the error. If your handler does:
@@ -215,11 +215,11 @@ Delivered via SNS email subscriptions. After your first `sst deploy`, AWS sends 
 
 ### Slack
 
-Create an [incoming webhook](https://api.slack.com/messaging/webhooks) for the channel you want alerts in and paste the URL into `slack`. Messages arrive as the alert subject in bold followed by the plain-text body in a code block.
+Create an [incoming webhook](https://api.slack.com/messaging/webhooks) for the channel you want alerts in and paste the URL into `slack`. Messages arrive as the alert subject in bold followed by the plain-text body in a code block. `&`, `<` and `>` are escaped before sending, so values like `<redacted>` render literally and text from a request (for example `<!channel>`) can never trigger a mention.
 
 ### Discord
 
-Create a channel webhook (Channel Settings → Integrations → Webhooks → New Webhook → Copy Webhook URL) and paste it into `discord`. Same shape as Slack.
+Create a channel webhook (Channel Settings → Integrations → Webhooks → New Webhook → Copy Webhook URL) and paste it into `discord`. Same shape as Slack. Every message is sent with `allowed_mentions: { parse: [] }`, so an `@everyone`, `@here` or user mention in the alert text never pings anyone.
 
 Discord caps a message at 2000 characters, so the raw error block is trimmed harder there (800 chars vs 4000 for email) — this is deliberate, so the `ANALYSIS` block always survives. If you want the untruncated stack trace, follow the `LOGS` link or read the email.
 
@@ -402,7 +402,7 @@ new Monitor("Alerts", {
 
 For a quick one-off investigation you can skip the handler half by setting `WWW_REDACT=off` in the function's environment; an explicit `redact` option always wins over it.
 
-Request **bodies** are only re-checked in the notifier for size, so an `allow` on a body field works with the wrapper setting alone. **Headers** and **identity** are re-checked, so those need both. When in doubt, set both.
+Request **bodies** are only re-checked in the notifier for size (clipped to the Monitor's `maxBodyChars`), so an `allow` on a body field works with the wrapper setting alone. **Headers** and **identity** are re-checked, so those need both. When in doubt, set both.
 
 
 ### Duplicate alerts

@@ -199,12 +199,20 @@ export function escapeCodeFence(text: string): string {
   return text.replace(/`/g, "ˋ");
 }
 
+export function escapeSlack(text: string): string {
+  return text
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+}
+
 const MAX_WEBHOOK_SUBJECT = 200;
 
 export interface WebhookLimits {
   errorChars: number;
   requestChars: number;
   totalChars: number;
+  escape?: (text: string) => string;
 }
 
 export function webhookMessage(
@@ -212,19 +220,48 @@ export function webhookMessage(
   bold: string,
   limits: WebhookLimits,
 ): string {
-  const subject = escapeCodeFence(
-    subjectFor(alert).slice(0, MAX_WEBHOOK_SUBJECT),
+  const escape = limits.escape ?? ((text: string): string => text);
+  const subject = escape(
+    escapeCodeFence(subjectFor(alert).slice(0, MAX_WEBHOOK_SUBJECT)),
   );
   const header = `${bold}${subject}${bold}\n`;
   const fence = "```\n\n```";
   const budget = limits.totalChars - header.length - fence.length;
-  const body = escapeCodeFence(
-    renderText(alert, {
-      errorChars: limits.errorChars,
-      requestChars: limits.requestChars,
-    }),
+  const body = escape(
+    escapeCodeFence(
+      renderText(alert, {
+        errorChars: limits.errorChars,
+        requestChars: limits.requestChars,
+      }),
+    ),
   );
   return `${header}\`\`\`\n${truncate(body, budget)}\n\`\`\``;
+}
+
+export interface SlackPayload {
+  text: string;
+}
+
+export interface DiscordPayload {
+  content: string;
+  allowed_mentions: { parse: string[] };
+}
+
+export function slackPayload(
+  alert: Alert,
+  limits: Omit<WebhookLimits, "escape">,
+): SlackPayload {
+  return { text: webhookMessage(alert, "*", { ...limits, escape: escapeSlack }) };
+}
+
+export function discordPayload(
+  alert: Alert,
+  limits: Omit<WebhookLimits, "escape">,
+): DiscordPayload {
+  return {
+    content: webhookMessage(alert, "**", limits),
+    allowed_mentions: { parse: [] },
+  };
 }
 
 export function truncate(text: string, max: number): string {

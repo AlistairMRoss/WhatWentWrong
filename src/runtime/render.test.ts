@@ -1,6 +1,9 @@
 import { describe, expect, test } from "bun:test";
 import {
+  discordPayload,
   escapeCodeFence,
+  escapeSlack,
+  slackPayload,
   renderRequest,
   renderText,
   subjectFor,
@@ -368,5 +371,57 @@ describe("webhookMessage with request context", () => {
   test("slack keeps the full body at its larger budget", () => {
     const message = webhookMessage({ ...LOG, requestContext: CTX }, "*", SLACK);
     expect(message).toContain('"userId":"u_8821"');
+  });
+});
+
+describe("escapeSlack", () => {
+  test("escapes the three characters slack treats as control syntax", () => {
+    expect(escapeSlack("a & <b> <!channel>")).toBe(
+      "a &amp; &lt;b&gt; &lt;!channel&gt;",
+    );
+    expect(escapeSlack("plain")).toBe("plain");
+  });
+});
+
+describe("slackPayload", () => {
+  const redacted: LogAlert = {
+    ...LOG,
+    errorText: "Error: <!channel> failed & died",
+    requestContext: { ...CTX, headers: { authorization: "<redacted>" } },
+  };
+
+  test("escapes the redaction marker so slack renders it literally", () => {
+    const { text } = slackPayload(redacted, SLACK);
+    expect(text).toContain("authorization: &lt;redacted&gt;");
+    expect(text).not.toContain("<redacted>");
+  });
+
+  test("escapes control sequences in the subject and body", () => {
+    const { text } = slackPayload(redacted, SLACK);
+    expect(text).not.toContain("<!channel>");
+    expect(text.startsWith("*[Alert]")).toBe(true);
+    expect(text).toContain("&lt;!channel&gt; failed &amp; died");
+  });
+
+  test("the escaped message still fits the total budget", () => {
+    const alert: LogAlert = { ...LOG, errorText: "<>".repeat(20000) };
+    const { text } = slackPayload(alert, { ...SLACK, errorChars: 40000, totalChars: 5000 });
+    expect(text.length).toBeLessThanOrEqual(5000);
+  });
+});
+
+describe("discordPayload", () => {
+  test("suppresses every mention type", () => {
+    const alert: AccessLogAlert = { ...ACCESS, route: "GET /@everyone" };
+    const payload = discordPayload(alert, DISCORD);
+    expect(payload.allowed_mentions).toEqual({ parse: [] });
+    expect(payload.content).toContain("@everyone");
+  });
+
+  test("leaves the content unescaped", () => {
+    const alert: LogAlert = { ...LOG, errorText: "a < b" };
+    expect(discordPayload(alert, DISCORD).content).toBe(
+      webhookMessage(alert, "**", DISCORD),
+    );
   });
 });

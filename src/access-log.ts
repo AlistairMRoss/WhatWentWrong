@@ -6,11 +6,13 @@ export interface AccessLogFields {
   authorizerContext?: readonly string[];
 }
 
+export interface AccessLogSettings {
+  destinationArn?: unknown;
+  format?: unknown;
+}
+
 export interface AccessLogStageArgs {
-  accessLogSettings?: {
-    destinationArn?: unknown;
-    format?: unknown;
-  };
+  accessLogSettings?: unknown;
 }
 
 const QUOTED_FIELDS: ReadonlyArray<readonly [string, string]> = [
@@ -75,12 +77,27 @@ export function buildAccessLogFormat(fields: AccessLogFields = {}): string {
   return JSON.stringify(entries);
 }
 
+export function isAccessLogSettings(
+  value: unknown,
+): value is AccessLogSettings {
+  if (typeof value !== "object" || value === null) return false;
+  const shaped = value as { then?: unknown; apply?: unknown };
+  return typeof shaped.then !== "function" && typeof shaped.apply !== "function";
+}
+
 export function accessLogFormat(
   fields: AccessLogFields = {},
-): (args: AccessLogStageArgs) => void {
+): (args: AccessLogStageArgs) => undefined {
   const format = buildAccessLogFormat(fields);
-  return (args: AccessLogStageArgs): void => {
-    args.accessLogSettings = { ...args.accessLogSettings, format };
+  return (args: AccessLogStageArgs): undefined => {
+    const current = args.accessLogSettings;
+    if (current !== undefined && !isAccessLogSettings(current)) {
+      throw new Error(
+        "accessLogFormat: the stage's accessLogSettings is a Promise or Output, so the format cannot be merged into it. Set accessLogSettings.format yourself using buildAccessLogFormat().",
+      );
+    }
+    args.accessLogSettings = { ...current, format };
+    return undefined;
   };
 }
 

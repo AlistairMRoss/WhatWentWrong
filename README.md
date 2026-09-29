@@ -525,7 +525,7 @@ type MetricMatcher = number | `${number}xx` | `${number}${number}x`;
 Also exported from the package root:
 
 ```ts
-function accessLogFormat(fields?: AccessLogFields): (args: AccessLogStageArgs) => void;
+function accessLogFormat(fields?: AccessLogFields): (args: AccessLogStageArgs) => undefined;
 
 interface AccessLogFields {
   authorizerClaims?: readonly string[];
@@ -540,6 +540,10 @@ function captureRequest<E, R>(
   handler: (event: E, context?: unknown) => R | Promise<R>,
   options?: CaptureOptions,
 ): (event: E, context?: unknown) => Promise<R>;
+function captureRequest<E, C, R>(
+  handler: (event: E, context: C) => R | Promise<R>,
+  options?: CaptureOptions,
+): (event: E, context: C) => Promise<R>;
 
 interface CaptureOptions {
   headers?: boolean;
@@ -551,7 +555,22 @@ interface CaptureOptions {
 }
 ```
 
+The second overload keeps a required, typed `context` (e.g. `(event: APIGatewayProxyEventV2, context: Context) => …`), so a wrapped handler is assignable back to its original type.
+
 `whatwentwrong/capture` imports nothing from Pulumi or SST, so it is safe to import from a Lambda handler.
+
+### Wrapping handlers you don't own
+
+If a module creates the routes for you (an auth package, say), you can still wrap its handlers as long as it lets you set the handler base path. Point that path at a local folder containing one file per handler, each re-exporting the original through `captureRequest`:
+
+```ts
+import { captureRequest } from "whatwentwrong/capture";
+import { main as inner } from "../../node_modules/some-auth/dist/handlers/refresh.handler.js";
+
+export const main = captureRequest(inner);
+```
+
+Use a relative path into `node_modules` when the package's `exports` map blocks deep imports. Every handler the module resolves from that base path needs a file, including ones you don't want captured (authorizers, CORS preflight), which can be a plain `export { main } from "…"`.
 
 The `Monitor` instance also exposes:
 

@@ -13,7 +13,11 @@ export type {
   WebhookChannel,
 } from "./monitor.js";
 export { accessLogFormat, buildAccessLogFormat } from "./access-log.js";
-export type { AccessLogFields, AccessLogStageArgs } from "./access-log.js";
+export type {
+  AccessLogFields,
+  AccessLogSettings,
+  AccessLogStageArgs,
+} from "./access-log.js";
 export type { CaptureOptions } from "./capture.js";
 export type { RequestContext } from "./runtime/request-context.js";
 export type { RedactionPolicy } from "./redact.js";

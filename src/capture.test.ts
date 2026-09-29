@@ -441,3 +441,36 @@ describe("captureRequest redaction control", () => {
     }
   });
 });
+
+describe("captureRequest with a required typed context", () => {
+  interface LambdaContext {
+    awsRequestId: string;
+  }
+  type StrictHandler = (
+    event: typeof EVENT,
+    context: LambdaContext,
+  ) => Promise<{ statusCode: number; body: string }>;
+
+  test("wraps a handler whose context parameter is required", async () => {
+    trap();
+    const inner: StrictHandler = async (_event, context) => ({
+      statusCode: 500,
+      body: context.awsRequestId,
+    });
+    const wrapped: StrictHandler = captureRequest(inner);
+    const result = await wrapped(EVENT, { awsRequestId: "ctx-1" });
+    expect(result).toEqual({ statusCode: 500, body: "ctx-1" });
+    expect(captured()).toHaveLength(1);
+  });
+
+  test("falls back to the lambda context request id when the event has none", async () => {
+    trap();
+    const inner = async (
+      _event: { rawPath: string },
+      _context: LambdaContext,
+    ): Promise<{ statusCode: number }> => ({ statusCode: 502 });
+    const wrapped = captureRequest(inner);
+    await wrapped({ rawPath: "/x" }, { awsRequestId: "ctx-2" });
+    expect(captured()[0]?.requestId).toBe("ctx-2");
+  });
+});

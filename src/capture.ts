@@ -64,8 +64,16 @@ interface ResolvedOptions {
 
 export function captureRequest<E, R>(
   handler: (event: E, context?: unknown) => R | Promise<R>,
+  options?: CaptureOptions,
+): (event: E, context?: unknown) => Promise<R>;
+export function captureRequest<E, C, R>(
+  handler: (event: E, context: C) => R | Promise<R>,
+  options?: CaptureOptions,
+): (event: E, context: C) => Promise<R>;
+export function captureRequest<E, C, R>(
+  handler: (event: E, context: C) => R | Promise<R>,
   options: CaptureOptions = {},
-): (event: E, context?: unknown) => Promise<R> {
+): (event: E, context: C) => Promise<R> {
   const resolved: ResolvedOptions = {
     policy: policyFrom({
       redact: resolveRedact(options.redact),
@@ -78,7 +86,7 @@ export function captureRequest<E, R>(
       options.captureStatusFrom ?? DEFAULT_CAPTURE_STATUS_FROM,
   };
 
-  return async (event: E, context?: unknown): Promise<R> => {
+  return async (event: E, context: C): Promise<R> => {
     try {
       const result = await handler(event, context);
       const status = statusOf(result);

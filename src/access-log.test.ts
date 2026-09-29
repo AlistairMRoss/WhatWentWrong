@@ -4,7 +4,9 @@ import {
   accessLogRequestContext,
   buildAccessLogFormat,
   numberOrUndefined,
+  isAccessLogSettings,
   presentString,
+  type AccessLogSettings,
   type AccessLogStageArgs,
 } from "./access-log.js";
 import { DEFAULT_REDACTION } from "./redact.js";
@@ -105,11 +107,21 @@ describe("buildAccessLogFormat", () => {
   });
 });
 
+function settingsOf(args: AccessLogStageArgs): AccessLogSettings {
+  const settings = args.accessLogSettings;
+  if (!isAccessLogSettings(settings)) throw new Error("settings not set");
+  return settings;
+}
+
 describe("accessLogFormat", () => {
   test("sets the format on the stage args", () => {
     const args: AccessLogStageArgs = {};
     accessLogFormat()(args);
-    expect(typeof args.accessLogSettings?.format).toBe("string");
+    expect(typeof settingsOf(args).format).toBe("string");
+  });
+
+  test("returns undefined to satisfy SST's Transform signature", () => {
+    expect(accessLogFormat()({})).toBeUndefined();
   });
 
   test("preserves an existing destinationArn", () => {
@@ -117,7 +129,7 @@ describe("accessLogFormat", () => {
       accessLogSettings: { destinationArn: "arn:aws:logs:eu-west-1:1:log-group:x" },
     };
     accessLogFormat()(args);
-    expect(args.accessLogSettings?.destinationArn).toBe(
+    expect(settingsOf(args).destinationArn).toBe(
       "arn:aws:logs:eu-west-1:1:log-group:x",
     );
   });
@@ -127,15 +139,37 @@ describe("accessLogFormat", () => {
       accessLogSettings: { destinationArn: "arn", format: "old" },
     };
     accessLogFormat()(args);
-    expect(args.accessLogSettings?.format).not.toBe("old");
+    expect(settingsOf(args).format).not.toBe("old");
   });
 
   test("passes custom fields through", () => {
     const args: AccessLogStageArgs = {};
     accessLogFormat({ authorizerContext: ["userId"] })(args);
-    expect(String(args.accessLogSettings?.format)).toContain(
+    expect(String(settingsOf(args).format)).toContain(
       "$context.authorizer.userId",
     );
+  });
+
+  test("throws rather than dropping settings it cannot merge", () => {
+    const args: AccessLogStageArgs = {
+      accessLogSettings: Promise.resolve({ destinationArn: "arn" }),
+    };
+    expect(() => accessLogFormat()(args)).toThrow(/Promise or Output/);
+  });
+});
+
+describe("isAccessLogSettings", () => {
+  test("accepts plain objects", () => {
+    expect(isAccessLogSettings({})).toBe(true);
+    expect(isAccessLogSettings({ destinationArn: "arn", format: "{}" })).toBe(true);
+  });
+
+  test("rejects promises, outputs and non-objects", () => {
+    expect(isAccessLogSettings(Promise.resolve({}))).toBe(false);
+    expect(isAccessLogSettings({ apply: () => undefined })).toBe(false);
+    expect(isAccessLogSettings(null)).toBe(false);
+    expect(isAccessLogSettings("x")).toBe(false);
+    expect(isAccessLogSettings(undefined)).toBe(false);
   });
 });
 
